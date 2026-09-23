@@ -5,7 +5,6 @@
 package bootstrap
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -66,23 +65,5 @@ func NewModel(cfg ModelConfig) (model.Model, error) {
 		opts = append(opts, openai.WithBaseURL(u))
 	}
 
-	m := openai.New(name, opts...)
-	if m == nil {
-		return nil, errors.New("bootstrap: openai provider returned nil model")
-	}
-	return m, nil
-}
-
-// WrapModelError 给 provider 错误补上 base URL 上下文。
-//
-// 动机（issue #2 AC）：provider 抛出的 "connection failed" 不含端点信息，
-// 排障时需要知道"连不上哪里"。此处把 URL 显式拼进错误链。
-func WrapModelError(baseURL string, err error) error {
-	if err == nil {
-		return nil
-	}
-	if strings.TrimSpace(baseURL) == "" {
-		return err
-	}
-	return fmt.Errorf("model request to %s failed: %w", baseURL, err)
+	return openai.New(name, opts...), nil
 }

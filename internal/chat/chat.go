@@ -107,7 +107,10 @@ func oneTurn(ctx context.Context, r runner.Runner, opts Options, input string) e
 
 	events, err := r.Run(ctx, opts.UserID, opts.SessionID, msg)
 	if err != nil {
-		return bootstrap.WrapModelError(bootstrap.ResolveBaseURL(opts.Config), err)
+		// 此处 err 是 session/agent 选择类的同步错误，不含网络失败——
+		// 模型连接错误走事件流（下方 ev.IsError()），其文本已由 provider
+		// 注入请求 URL（实测：401 与连接拒绝均含完整 URL），故无需再包装。
+		return err
 	}
 
 	var printed strings.Builder
@@ -121,6 +124,10 @@ func oneTurn(ctx context.Context, r runner.Runner, opts Options, input string) e
 
 		// 增量文本：streaming 下内容在 Choices[0].Delta.Content。
 		// 非流式回退：整段在 Choices[0].Message.Content（一次性输出）。
+		//
+		// 只取 Choices[0]：CLI 场景未请求多候选（未设 GenerationConfig.N），
+		// 所有主流 provider 默认 n=1。若将来启用多候选，此处需改为遍历
+		// 并明确各候选的输出策略（否则其余候选会被静默丢弃）。
 		if ev.Response != nil && len(ev.Choices) > 0 {
 			ch := ev.Choices[0]
 			if delta := ch.Delta.Content; delta != "" {
