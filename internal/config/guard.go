@@ -22,6 +22,36 @@ var ReservedKeys = map[string]struct{}{
 	"TOOL_POLICY":    {},
 }
 
+// CredentialKeys 是渠道凭据的保留键集合。
+//
+// 与 ReservedKeys 分列而非合并，是因为威胁模型不同：
+//   - 控制值被覆盖 → 提权（改沙箱策略、模型路由）
+//   - 凭据被覆盖 → 凭据劫持（把飞书回调的验签口令换成攻击者已知的值，
+//     于是伪造事件能通过验签——渠道边界直接失效）
+//
+// 但两者的防护动作相同（工作区提供的同名键一律跳过），故在检查点合并。
+//
+// 依据：设计文档 §4.4.2 要求凭据来自受信启动环境（NFR-9.1）；
+// 03-原型设计文档.md:917 的配置约定「所有凭据走环境变量，配置文件不落密钥」。
+var CredentialKeys = map[string]struct{}{
+	// 飞书 webhook 验签口令（#5）
+	"FEISHU_VERIFICATION_TOKEN": {},
+	// 飞书事件解密口令（#5）
+	"FEISHU_ENCRYPT_KEY": {},
+	// 飞书应用凭据（#9 出站与长连接使用）
+	"FEISHU_APP_ID":     {},
+	"FEISHU_APP_SECRET": {},
+}
+
+// isReserved 判断键是否受保护（工作区不可提供）。
+func isReserved(key string) bool {
+	if _, ok := ReservedKeys[key]; ok {
+		return true
+	}
+	_, ok := CredentialKeys[key]
+	return ok
+}
+
 // MergeWorkspaceEnv 把工作区环境合并到受信基线上，返回新 map（不修改入参）。
 //
 // 规则：
@@ -35,7 +65,7 @@ func MergeWorkspaceEnv(base, workspace map[string]string, warn func(string)) map
 		out[k] = v
 	}
 	for k, v := range workspace {
-		if _, reserved := ReservedKeys[k]; reserved {
+		if isReserved(k) {
 			if warn != nil {
 				warn("skipping managed env variable in workspace override: " + k)
 			}
