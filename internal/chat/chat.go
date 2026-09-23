@@ -19,6 +19,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 
+	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
 )
 
@@ -32,6 +33,10 @@ type Options struct {
 	// ToolSets 是挂到 agent 上的工具集（如 MCP）。空表示无工具（issue #2 的行为）。
 	// 工具名会由 llmagent 加上 {toolSetName}_ 前缀（issue #3 AC-2）。
 	ToolSets []tool.ToolSet
+	// AllowTools 是工具白名单（issue #4）。空表示全部拒绝（安全基线）。
+	// 名字必须是「模型可见名」——MCP 工具要写 srvA_echo 而非 echo。
+	// 装配期会校验名字是否已注册，未注册即报错（AC-4）。
+	AllowTools []string
 	// Out 接收模型输出（默认 stdout 由调用方传入）。
 	Out io.Writer
 	// Echo 接收提示与状态（默认 stderr）。
@@ -80,8 +85,28 @@ func Run(ctx context.Context, in io.Reader, opts Options) error {
 	}
 	ag := llmagent.New("assistant", agentOpts...)
 
-	r := runner.NewRunner(opts.AppName, ag)
+	// 工具策略（issue #4）：默认拒绝 + 白名单放行。
+	// 必须在 agent 建好之后装配——AC-4 的校验要用 agent 暴露的
+	// 「模型可见工具名」（MCP 工具带 {server}_ 前缀），而非原始 ToolSet 的裸名。
+	policy, err := authz.BuildToolPolicy(authz.ToolPolicyConfig{
+		Allow:      opts.AllowTools,
+		Registered: ag.Tools(),
+	})
+	if err != nil {
+		return err
+	}
+
+	runnerOpts := []runner.Option{runner.WithPlugins(policy.Plugin())}
+	r := runner.NewRunner(opts.AppName, ag, runnerOpts...)
 	defer r.Close()
+
+	if len(opts.AllowTools) > 0 {
+		fmt.Fprintf(opts.Echo, "工具策略：默认拒绝，放行 %v\n", policy.AllowedTools())
+	} else if len(ag.Tools()) > 0 {
+		// 有工具但无白名单：全部会被拒。显式提示，避免"配了工具却都不能用"的困惑。
+		fmt.Fprintf(opts.Echo, "工具策略：默认拒绝，白名单为空——%d 个已注册工具均不可执行\n",
+			len(ag.Tools()))
+	}
 
 	fmt.Fprintf(opts.Echo, "taiji chat · model=%s session=%s\n输入 exit 退出。\n\n",
 		opts.Config.Name, opts.SessionID)

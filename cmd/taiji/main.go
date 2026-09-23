@@ -102,6 +102,8 @@ func runChat(args []string) int {
 	debug := fs.Bool("debug", false, "打印每轮调试信息（含多轮历史观察点）")
 	mcpSpecs := multiFlag{}
 	fs.Var(&mcpSpecs, "mcp", "挂载 MCP server，格式 name=command [args...]（可重复）")
+	allowTools := multiFlag{}
+	fs.Var(&allowTools, "allow-tool", "放行的工具名（模型可见名，如 srvA_echo；可重复）。未列出的工具一律拒绝")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -145,6 +147,7 @@ func runChat(args []string) int {
 		Config:      modelCfg,
 		Instruction: *instruction,
 		ToolSets:    toolSets,
+		AllowTools:  allowTools,
 		Out:         os.Stdout,
 		Echo:        os.Stderr,
 		Debug:       *debug,
