@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Implementation Notes — Issue #0005</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #FAF9F6;
+      color: #1a1a1a;
+      padding: 2.5rem 2rem;
+      line-height: 1.7;
+    }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { font-size: 1.375rem; font-weight: 700; margin-bottom: 0.25rem; }
+    .meta { color: #8B8680; font-size: 0.8125rem; margin-bottom: 2rem; }
+    h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-top: 2rem;
+      margin-bottom: 0.75rem;
+      padding-bottom: 0.375rem;
+      border-bottom: 1px solid #E8E4DE;
+      display: flex; align-items: center; gap: 0.5rem;
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+    }
+    .dot.design { background: #5B8A72; }
+    .dot.deviation { background: #D97757; }
+    .dot.tradeoff { background: #4A6FA5; }
+    .dot.question { background: #D4A843; }
+    .item {
+      background: #FFFFFF;
+      border: 1px solid #E8E4DE;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 0.75rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+    }
+    .item h3 { font-size: 0.875rem; font-weight: 600; margin-bottom: 0.375rem; }
+    .item p { font-size: 0.8125rem; color: #4A4540; margin-bottom: 0.375rem; }
+    .label {
+      display: inline-block;
+      font-size: 0.6875rem;
+      font-weight: 500;
+      padding: 0.125rem 0.5rem;
+      border-radius: 4px;
+      margin-right: 0.375rem;
+    }
+    .label-design { background: #F5F8F6; color: #5B8A72; border: 1px solid #5B8A72; }
+    .label-deviation { background: #FFF5F0; color: #D97757; border: 1px solid #D97757; }
+    .label-tradeoff { background: #F0F4F8; color: #4A6FA5; border: 1px solid #4A6FA5; }
+    .label-question { background: #FDF8F0; color: #D4A843; border: 1px solid #D4A843; }
+    .none { color: #B0AAA4; font-style: italic; font-size: 0.8125rem; }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.75rem; background: #F4F1EC; padding: 0.0625rem 0.25rem;
+      border-radius: 3px;
+    }
+    .footer {
+      text-align: center; margin-top: 2.5rem; color: #B0AAA4;
+      font-size: 0.6875rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Implementation Notes</h1>
+    <p class="meta">Issue <a href="https://github.com/kalandramo/TaiJi/issues/5">#0005</a> &mdash; 飞书入站：验签 + 解密 + 解析 &mdash; 2026-09-23</p>
+
+    <h2><span class="dot design"></span> Design Decisions</h2>
+
+    <div class="item">
+      <h3><span class="label label-design">Decision</span> 未知 chat_type 一律归为 group</h3>
+      <p><strong>歧义点：</strong>设计文档只列出 <code>direct | group</code> 两个取值，未规定平台返回未知值时如何归一化。</p>
+      <p><strong>选择：</strong><code>normalizeChatType</code> 仅在平台值为 <code>"p2p"</code> 时返回 <code>ChatDirect</code>，其余（含空串）一律返回 <code>ChatGroup</code>。</p>
+      <p><strong>理由：</strong>群聊要过 @ 门禁，私聊直接放行。把未知值当 direct 会绕过门禁——正是 <code>docs/03-原型设计文档.md:576</code> 记录的那类静默失效（happyclaw 旧版 <code>botOpenId</code> 为空时"安全降级=放行"导致 <code>require_mention</code> 在群内静默失效）。归一化方向必须朝 fail-closed。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-design">Decision</span> 渠道凭据独立成 CredentialKeys 集合</h3>
+      <p><strong>歧义点：</strong>设计文档 §4.6 只列出六个控制值键（<code>MODEL_ROUTE</code> 等），完全未提渠道凭据是否受同等保护、该放进哪个集合。</p>
+      <p><strong>选择：</strong>新增 <code>CredentialKeys</code>（<code>FEISHU_VERIFICATION_TOKEN</code> / <code>FEISHU_ENCRYPT_KEY</code> / <code>FEISHU_APP_ID</code> / <code>FEISHU_APP_SECRET</code>），与 <code>ReservedKeys</code> 分列，在 <code>isReserved</code> 检查点合并。</p>
+      <p><strong>理由：</strong>两者威胁模型不同——控制值被覆盖是<em>提权</em>（改沙箱策略、模型路由），凭据被覆盖是<em>凭据劫持</em>（把验签口令换成攻击者已知值，伪造事件即可通过验签，渠道边界当场失效）。但防护动作相同（工作区同名键一律跳过），故分列集合、合并检查点：既保留分类语义便于审计，又只有单一过滤点。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-design">Decision</span> 引入 400 区分"已验签但畸形"与"认证失败"</h3>
+      <p><strong>歧义点：</strong>issue 只规定了 403（验签失败）。未规定"验签通过但事件体畸形"该回什么。</p>
+      <p><strong>选择：</strong>状态码映射为 405（非 POST）/ 403（凭据未配置、验签失败、解密失败）/ 400（已通过验签但消息事件缺必需字段）/ 200（通过）/ 500（下游失败，让飞书重试）。</p>
+      <p><strong>理由：</strong>验签已通过的畸形请求不是认证失败，混用 403 会让运维在排查时误判为凭据问题。500 的选择也有语义：下游不可用时不能让飞书认为投递成功，否则平台不再重试、消息永久丢失。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-design">Decision</span> 文本提取按"能否解析出 text 字段"判定，而非按 message_type</h3>
+      <p><strong>歧义点：</strong>未规定 <code>message_type</code> 字段缺失时的行为。飞书事件体的 <code>content</code> 是一个 JSON 字符串（如 <code>{"text":"hello"}</code>），非纯文本。</p>
+      <p><strong>选择：</strong><code>extractText</code> 直接尝试解析 <code>{"text":...}</code>，能解出就用，解不出返回空串。</p>
+      <p><strong>理由：</strong>初版按 <code>message_type == "text"</code> 把关，实测 <code>TestHandler_LogsParsedFields</code> 失败——日志里 <code>text=""</code>，用户输入被丢弃。而两种判定对非文本消息（image 的 <code>{"image_key":...}</code>、post 的 <code>{"title":...,"content":[[...]]}</code>）结果一致（都是空串），所以按内容判定不牺牲任何安全性，却不会因信封字段缺失而丢失正文。这是测试驱动暴露的真实缺陷，不是构造问题。</p>
+    </div>
+
+    <h2><span class="dot deviation"></span> Deviations</h2>
+
+    <div class="item">
+      <h3><span class="label label-deviation">Deviation</span> 未定义连接层 Channel 接口</h3>
+      <p><strong>规范怎么说：</strong><code>docs/03-原型设计文档.md:248</code>（§3.3 目录结构）把 <code>internal/channel/channel.go</code>（连接层 <code>Channel</code> 接口）列为渠道层的第一个文件。</p>
+      <p><strong>实际实现：</strong>只定义 <code>internal/channel/inbound.go</code>（入站层 <code>InboundSource</code>），不定义 <code>Channel</code>。</p>
+      <p><strong>为什么：</strong>issue #5 明确"只做 webhook 入站；出站与端到端闭环见后续 Issue"，且 6 条 AC 全部落在 <code>InboundSource</code> 三方法面上。<code>Channel</code> 需要 <code>SendMessage</code>（出站，#9 范围）与长连接（#9 范围），现在定义会产生三个永不调用的空方法——正是设计文档 §4.4.1 反对的单接口形态。代价：目录结构与 §3.3 暂不一致；收益：零 stub、零未验证代码面。#9 实现连接层时再定义，届时 <code>var _ Channel = (*feishu.Channel)(nil)</code> 编译期断言才有真实对象可锁。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-deviation">Deviation</span> 凭据未配置时拒绝 URL 挑战请求</h3>
+      <p><strong>规范怎么说：</strong>设计文档 §4.4.2 引用的参照实现 WeKnora <code>internal/im/feishu/adapter.go:238-283</code>，其 <code>HandleURLVerification</code> 只做解密与 challenge 提取，<strong>不校验凭据</strong>——未配置 token 的部署仍会应答挑战。</p>
+      <p><strong>实际实现：</strong>凭据未配置时，handler 在挑战判定之前就返回 403，连挑战请求一并拒绝。</p>
+      <p><strong>为什么：</strong>issue #5 的 AC 原文是"未配置 verification token 时，端点拒绝所有回调（fail-closed），不是放行"。把挑战请求排除在该约束外，等于承认"凭据缺失时端点仍对外服务"。<strong>代价必须明说：</strong>未配置凭据的部署无法完成飞书首次 URL 校验，会看到 403 而非 challenge 回显。这是期望行为——配置凭据是启用端点的前置条件，不是可选调优项。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-deviation">Deviation</span> 扩展了 §4.6 的保护键集语义</h3>
+      <p><strong>规范怎么说：</strong>设计文档 §4.6 定义"保留键"= 六个运行时控制值键，其语义是"agent 可写工作区不得覆盖的控制面"。</p>
+      <p><strong>实际实现：</strong><code>ReservedKeys</code> 保持六键不变，另立 <code>CredentialKeys</code> 四键；过滤函数从"仅查 ReservedKeys"改为"查两者并集"。</p>
+      <p><strong>为什么：</strong>严格说这是规范未覆盖而非违背，但它确实改变了 <code>MergeWorkspaceEnv</code> 的行为边界——原先"保留键"等价于控制值，现在受保护面含凭据。如实记录，因为 §4.6 末尾关于"v1.4 NFR-9.2 要求三处纵深防御、原型降级为一处"的说明只针对控制值，未涵盖凭据路径。</p>
+    </div>
+
+    <h2><span class="dot tradeoff"></span> Tradeoffs</h2>
+
+    <div class="item">
+      <h3><span class="label label-tradeoff">Tradeoff</span> token 比对 vs X-Lark-Signature 签名校验</h3>
+      <p><strong>备选：</strong>① 仅比对 <code>header.token</code>（参照实现路径）；② 补 <code>X-Lark-Signature</code> 签名校验（timestamp + nonce + encryptKey + body 拼接）。</p>
+      <p><strong>取舍：</strong>选 ①。设计文档 §4.4.2 已标注"签名算法的精确拼接顺序本会话未逐字核实"（官方文档页为 SPA 无法抓取正文），采用 token 路径规避该不确定性。</p>
+      <p><strong>代价：</strong>token 随事件体传输，强度依赖 TLS 与 token 保密，<strong>弱于基于密钥的签名</strong>。若后续核实了签名算法，应在 <code>VerifyCallback</code> 补第三层校验——接口位无需变动。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-tradeoff">Tradeoff</span> 常量时间比对 vs 普通 ==</h3>
+      <p><strong>备选：</strong>① <code>ev.Header.Token == s.cfg.VerificationToken</code>；② <code>subtle.ConstantTimeCompare</code>。</p>
+      <p><strong>取舍：</strong>选 ②。代价是可读性略降（需处理长度不等时的短路语义）；收益是不逐字节泄露前缀匹配长度，消除时序侧信道。对本地验签路径属低成本高收益。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-tradeoff">Tradeoff</span> 凭据未配置时"启动并拒绝" vs "启动失败退出"</h3>
+      <p><strong>备选：</strong>① <code>serve</code> 发现无 <code>FEISHU_VERIFICATION_TOKEN</code> 即报错退出；② 打印警告后仍启动，由端点拒绝一切请求。</p>
+      <p><strong>取舍：</strong>选 ②。收益：运维能看到"监听 :8080，webhook 路径 /webhook/feishu"与明确的原因说明，而不是一个静默退出的进程。代价：服务"起来了但不工作"，依赖运维阅读警告；若选 ①，容器编排会因反复重启掩盖真实原因。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-tradeoff">Tradeoff</span> 12 文件单提交 vs 按内聚性门禁拆分</h3>
+      <p><strong>备选：</strong>① 按门禁建议拆成多个提交；② 用 <code>force=true</code> 覆盖门禁，单提交。</p>
+      <p><strong>取舍：</strong>选 ②。理由：<code>internal/channel/feishu/config.go</code> 的一致性测试 <code>TestCredentialEnvKeysMatchConfigGuard</code> 依赖 <code>internal/config/guard.go</code> 的 <code>CredentialKeys</code>；拆开会让中间提交处于编译失败或测试红状态。收益：每个提交都是绿的。代价：单提交较大（2051 行），审查面宽。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-tradeoff">Tradeoff</span> 单独提交 main.go vs 等待并发会话</h3>
+      <p><strong>备选：</strong>① 不提交 <code>main.go</code>，留给 #2 会话；② 单独提交并在 message 中如实标注。</p>
+      <p><strong>取舍：</strong>选 ②。理由：<code>main.go</code> 的未提交 diff 中，#2 的 <code>runChat</code> 接线与本次的 <code>runServe</code> 接线共享同一个 import 块（<code>internal/chat</code> 与 <code>internal/channel/feishu</code> 同块），git 无法按 hunk 拆分——单独提交任一侧都会因 "imported and not used" 编译失败。代价：该提交（<code>53f30a2</code>）含非本 issue 代码，归属上不完全干净。已确认 <code>f88f597</code> 未包含 main.go，故不存在覆盖 #2 在途改动的风险。</p>
+    </div>
+
+    <h2><span class="dot question"></span> Open Questions</h2>
+
+    <div class="item">
+      <h3><span class="label label-question">Question</span> go test -race 未运行——并发安全未验证</h3>
+      <p>环境无 gcc（<code>which gcc</code> 无输出），<code>CGO_ENABLED=1</code> 后报 <code>cgo: C compiler "gcc" not found</code>。设计文档 Wave 6 的验证命令要求 <code>go test ./channel/... -race</code>。<code>Handler</code> 的 <code>OnMessage</code>/<code>Logf</code> 回调在并发请求下的安全性<strong>未在 race 检测下验证</strong>。</p>
+      <p><strong>请确认：</strong>是否需要补装 gcc 后补跑，或接受当前（非 race）验证强度？</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-question">Question</span> main.go 提交卷入了 #2 会话的在途改动</h3>
+      <p>提交 <code>53f30a2</code> 同时带入 <code>runChat</code> 接线（chat 包调用、instruction/debug flags、signalContext）。我未触碰 <code>cmd/taiji/main_test.go</code>，它仍留在工作区属 #2 会话。</p>
+      <p><strong>请确认：</strong>#2 会话无未保存的 main.go 在途改动被覆盖。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-question">Question</span> 是否补 X-Lark-Signature 第三层校验</h3>
+      <p>当前只用 token 比对。若核实了飞书签名算法（timestamp + nonce + encryptKey + body 的拼接顺序），是否需要在 <code>VerifyCallback</code> 补签名校验层？接口位已预留，无需变动签名。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-question">Question</span> 富文本（post）消息正文未解析</h3>
+      <p><code>extractText</code> 只处理 <code>{"text":...}</code> 形态。富文本 post 的正文在 <code>content</code> 数组里，<code>text</code> 字段不存在，因此其 <code>Content</code> 为空串。</p>
+      <p><strong>请确认：</strong>验收线是否要求处理富文本？若是，需补 post 分支。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-question">Question</span> MentionedBot 字段推迟到 #6</h3>
+      <p><code>ChannelMessageMeta</code> 当前不含 <code>MentionedBot</code>（设计文档 §5.5.2 的字段集含它）。理由：其计算依赖已配置的 <code>bot_open_id</code>，属触发门禁（#6）的输入面；本 issue 不引入当前无法真实填充的字段。</p>
+      <p><strong>请确认：</strong>由 #6 落地时补该字段，届时由门禁负责比对（§4.4.3 第 4 条）。</p>
+    </div>
+
+    <div class="item">
+      <h3><span class="label label-question">Question</span> deliver_task 在工作区根非 git 仓库时无法提交</h3>
+      <p>工作区根是 <code>E:\aiops</code>（不是 git 仓库），TaiJi 是独立仓库。调用 <code>deliver_task commit=true</code> 时报 <code>fatal: not a git repository (or any of the parent directories): .git</code>——门禁在根目录执行 git 时找不到 <code>.git</code>。本次降级为在 TaiJi 目录内用精确路径 <code>git add</code> + <code>git commit</code>（不用 <code>-A</code>），保持归属隔离。</p>
+      <p><strong>请确认：</strong>是否应把工作区根设为 <code>E:\aiops\TaiJi</code>，或让门禁感知子仓库？</p>
+    </div>
+
+    <p class="footer">Generated by goal-workflow /note-it</p>
+  </div>
+</body>
+</html>
