@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -99,6 +100,8 @@ func runChat(args []string) int {
 	fs, cfg := newFlagSet("chat", "交互式对话")
 	instruction := fs.String("instruction", "", "系统提示（可选）")
 	debug := fs.Bool("debug", false, "打印每轮调试信息（含多轮历史观察点）")
+	mcpSpecs := multiFlag{}
+	fs.Var(&mcpSpecs, "mcp", "挂载 MCP server，格式 name=command [args...]（可重复）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -119,12 +122,29 @@ func runChat(args []string) int {
 		modelCfg.BaseURL = v
 	}
 
+	// MCP 装配：配置非法或 server 起不来 → 立即失败退出（issue #3 AC-3）
+	mcpCfgs, err := parseMCPSpecs(mcpSpecs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "taiji chat: %v\n", err)
+		return 2
+	}
+	toolSets, err := bootstrap.NewMCPSets(mcpCfgs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "taiji chat: %v\n", err)
+		return 1
+	}
+	defer bootstrap.CloseMCPSets(toolSets)
+	for _, c := range mcpCfgs {
+		fmt.Fprintf(os.Stderr, "[mcp] %s 已就绪\n", c.Name)
+	}
+
 	ctx, cancel := signalContext()
 	defer cancel()
 
 	err = chat.Run(ctx, os.Stdin, chat.Options{
 		Config:      modelCfg,
 		Instruction: *instruction,
+		ToolSets:    toolSets,
 		Out:         os.Stdout,
 		Echo:        os.Stderr,
 		Debug:       *debug,
@@ -134,6 +154,37 @@ func runChat(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// multiFlag 收集可重复的字符串 flag。
+type multiFlag []string
+
+func (m *multiFlag) String() string { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(v string) error {
+	*m = append(*m, v)
+	return nil
+}
+
+// parseMCPSpecs 把 "name=command [args...]" 形式的 flag 解析成配置。
+func parseMCPSpecs(specs []string) ([]bootstrap.MCPServerConfig, error) {
+	out := make([]bootstrap.MCPServerConfig, 0, len(specs))
+	for _, s := range specs {
+		name, rest, ok := strings.Cut(s, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid --mcp %q: expected name=command [args...]", s)
+		}
+		fields := strings.Fields(strings.TrimSpace(rest))
+		if len(fields) == 0 {
+			return nil, fmt.Errorf("invalid --mcp %q: command is empty", s)
+		}
+		out = append(out, bootstrap.MCPServerConfig{
+			Name:      strings.TrimSpace(name),
+			Transport: "stdio",
+			Command:   fields[0],
+			Args:      fields[1:],
+		})
+	}
+	return out, nil
 }
 
 func runServe(args []string) int {
