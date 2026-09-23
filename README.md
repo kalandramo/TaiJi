@@ -2,7 +2,7 @@
 
 > Go 原生 Agent Harness —— 以 trpc-agent-go 的工程形态为基础，借鉴 dsh 的会话日志/事件溯源与 capability seam 理念，引入 Tianshu-harness 的认知治理层，并以 happyclaw 的 IM 渠道抽象实现渠道接入与权限管控（飞书优先）。
 
-当前阶段：**需求与设计定稿（v1.4.1），尚无代码实现。**
+当前阶段：**需求与设计定稿（v1.4.2），尚无代码实现。**
 
 ## 文档
 
