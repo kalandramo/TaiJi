@@ -30,15 +30,25 @@ func TestRun_UnknownCommandExitsNonZero(t *testing.T) {
 }
 
 func TestRun_ChatAndServeExist(t *testing.T) {
+	// 子命令"存在"的可靠断言是 --help（不依赖运行时配置）。
+	// 注意：#2 之后 chat/serve 会真正尝试装配模型，
+	// 无配置时非零退出是正确行为，不再断言 run(cmd)==0。
 	for _, cmd := range []string{"chat", "serve"} {
-		if code := run([]string{cmd}); code != 0 {
-			t.Errorf("run(%q) = %d, want 0", cmd, code)
+		code := run([]string{cmd, "-h"})
+		if code == 0 {
+			continue // flag 包对 -h 返回 ErrHelp，我们的 run 统一返回 2
 		}
-		// --help 也必须可用（子命令的 flag set 处理）
-		if code := run([]string{cmd, "-h"}); code != 2 {
-			// flag.ContinueOnError 对 -h 返回 ErrHelp，我们的 run 统一返回 2
-			t.Logf("run(%q, -h) = %d (flag.ErrHelp path)", cmd, code)
+		if code != 2 {
+			t.Errorf("run(%q, -h) = %d, want 2 (help path)", cmd, code)
 		}
+	}
+}
+
+func TestRun_ChatWithoutModelConfigFails(t *testing.T) {
+	// #2 AC: 模型名为空时必须非零退出，不得静默传空串给 provider。
+	t.Setenv("TAIJI_MODEL_NAME", "")
+	if code := run([]string{"chat"}); code == 0 {
+		t.Error("run(chat) with empty model name = 0, want non-zero")
 	}
 }
 
