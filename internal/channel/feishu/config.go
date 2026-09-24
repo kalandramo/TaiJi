@@ -27,7 +27,19 @@ func VerifyConfigFromEnv(cfg map[string]string) VerifyConfig {
 }
 
 // credentialEnvKeys 列出本包读取的全部凭据键，供一致性测试遍历。
-var credentialEnvKeys = []string{EnvVerificationToken, EnvEncryptKey}
+//
+// 必须覆盖**所有**本包从受信配置读取的凭据键——漏掉一个，
+// EnsureCredentialKeysProtected 就不会检查它，该键被工作区覆盖时无人报警。
+//
+// 历史缺口（issue #9）：新增 FEISHU_APP_ID/FEISHU_APP_SECRET 时，
+// config.CredentialKeys 加了保护，但这里没同步——自检形同虚设。
+// TestCredentialEnvKeysCoverConfigGuard 现在锁定反向一致性，防复发。
+var credentialEnvKeys = []string{
+	EnvVerificationToken, // webhook 验签
+	EnvEncryptKey,        // webhook 事件解密
+	EnvAppID,             // 出站与长连接（issue #9）
+	EnvAppSecret,         // 出站与长连接（issue #9）
+}
 
 // EnsureCredentialKeysProtected 断言本包读取的凭据键都受 config 层保护。
 //
@@ -49,4 +61,3 @@ type UnprotectedCredentialError struct{ Key string }
 func (e *UnprotectedCredentialError) Error() string {
 	return "feishu: credential key " + e.Key + " is not protected by config.CredentialKeys (workspace could override it)"
 }
-
