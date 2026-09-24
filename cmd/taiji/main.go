@@ -492,6 +492,19 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 			"工具策略默认拒绝，所有工具调用都会被拒。请显式列出要放行的工具名"+
 			"（如 mockmcp_echo）。", len(toolSets))
 	}
+	// 装配成功时也打印——否则启动输出里只有 SDK 的底层日志，
+	// 用户无法确认「MCP 到底挂上没」「白名单到底生效没」。
+	// CLI 路径一直有这两行，serve 路径曾缺（可观测性缺口）。
+	for _, c := range mcpCfgs {
+		logf("MCP server %q 已就绪（%s）", c.Name, c.Transport)
+	}
+	if len(toolSets) > 0 {
+		if len(allowTools) > 0 {
+			logf("工具策略：默认拒绝，放行 %v", allowTools)
+		} else {
+			logf("工具策略：默认拒绝，白名单为空——%d 个已注册工具均不可执行", len(toolSets))
+		}
+	}
 	// 远程 server 无认证头时提示：多数托管 MCP 服务要求 token，
 	// 缺失会以 401 形式在**调用时**才暴露，启动期提示更易定位。
 	for _, c := range mcpCfgs {
