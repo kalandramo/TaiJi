@@ -128,7 +128,11 @@ func runChat(args []string) int {
 	}
 
 	// MCP 装配：配置非法或 server 起不来 → 立即失败退出（issue #3 AC-3）
-	mcpCfgs, err := parseMCPSpecs(mcpSpecs)
+	//
+	// 来源合并：环境变量（TAIJI_MCP_SERVERS）在前，--mcp flag 追加在后。
+	// 两条路径都认，因为 CLI 与服务端（serve）应共用同一套配置面——
+	// 只认 flag 会让「设了环境变量却在 CLI 里不生效」成为静默缺口。
+	mcpCfgs, err := parseMCPSpecs(append(envMCPSpecs(), mcpSpecs...))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "taiji chat: %v\n", err)
 		return 2
@@ -150,7 +154,7 @@ func runChat(args []string) int {
 		Config:      modelCfg,
 		Instruction: *instruction,
 		ToolSets:    toolSets,
-		AllowTools:  allowTools,
+		AllowTools:  append(envAllowTools(), allowTools...),
 		Out:         os.Stdout,
 		Echo:        os.Stderr,
 		Debug:       *debug,

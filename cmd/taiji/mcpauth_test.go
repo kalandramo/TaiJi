@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -290,5 +291,112 @@ func TestParseMCPSpecs_RemoteWithAuthFromEnv(t *testing.T) {
 	// 值中不应有分隔符残留
 	if strings.Contains(c.Headers["Authorization"], ";") {
 		t.Error("分隔符 ; 未剥离")
+	}
+}
+
+// ===== 4. CLI 路径也认环境变量 =====
+
+// CLI 路径必须与 serve 路径共用同一套 MCP 配置面。
+//
+// 历史缺口：envMCPSpecs 只接在 serve 路径，CLI 只认 --mcp flag。
+// 后果是「设了 TAIJI_MCP_SERVERS 却在 taiji chat 里不生效」——
+// 无报错、无提示，工具静默不可用。
+func TestRunChat_ReadsMCPFromEnv(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	text := string(src)
+
+	start := indexOf(text, "func runChat(")
+	if start < 0 {
+		t.Fatal("runChat not found")
+	}
+	end := indexOf(text[start:], "\nfunc ")
+	if end < 0 {
+		end = len(text) - start
+	}
+	body := text[start : start+end]
+
+	if !contains(body, "envMCPSpecs()") {
+		t.Error("runChat 未读取 TAIJI_MCP_SERVERS——" +
+			"环境变量配了 MCP 却在 CLI 里静默失效")
+	}
+}
+
+// 合并语义：环境变量在前、flag 在后，两者都要进配置。
+func TestParseMCPSpecs_EnvAndFlagMerge(t *testing.T) {
+	t.Setenv("TAIJI_MCP_SERVERS", "fromenv=echo env-cmd")
+
+	// 模拟 runChat 的合并：env + flag
+	specs := append(envMCPSpecs(), "fromflag=echo flag-cmd")
+	cfgs, err := parseMCPSpecs(specs)
+	if err != nil {
+		t.Fatalf("parseMCPSpecs: %v", err)
+	}
+	if len(cfgs) != 2 {
+		t.Fatalf("got %d configs, want 2（env + flag）", len(cfgs))
+	}
+	names := []string{cfgs[0].Name, cfgs[1].Name}
+	if names[0] != "fromenv" || names[1] != "fromflag" {
+		t.Errorf("names = %v, want [fromenv fromflag]", names)
+	}
+}
+
+// 远程 server 从环境变量带认证头（stdio 不带——子进程无 HTTP 头概念）。
+func TestParseMCPSpecs_RemoteFromEnvCarriesAuth(t *testing.T) {
+	t.Setenv("TAIJI_MCP_SERVERS", "remotesrv=https://api.example.com/mcp")
+	t.Setenv("TAIJI_MCP_HEADERS_remotesrv", "Authorization:Bearer env-token")
+
+	cfgs, err := parseMCPSpecs(envMCPSpecs())
+	if err != nil {
+		t.Fatalf("parseMCPSpecs: %v", err)
+	}
+	if len(cfgs) != 1 {
+		t.Fatalf("got %d configs, want 1", len(cfgs))
+	}
+	if cfgs[0].Headers["Authorization"] != "Bearer env-token" {
+		t.Errorf("远程 server 应带认证头，got %v", cfgs[0].Headers)
+	}
+}
+
+// stdio server 不应带 HTTP 认证头——认证头只对远程有意义。
+// 这条锁住「不给本地子进程塞无意义的头」。
+func TestParseMCPSpecs_StdioIgnoresAuthHeaders(t *testing.T) {
+	t.Setenv("TAIJI_MCP_HEADERS_localsrv", "Authorization:Bearer nope")
+
+	cfgs, err := parseMCPSpecs([]string{"localsrv=echo hi"})
+	if err != nil {
+		t.Fatalf("parseMCPSpecs: %v", err)
+	}
+	if len(cfgs[0].Headers) != 0 {
+		t.Errorf("stdio server 不应有 Headers，got %v", cfgs[0].Headers)
+	}
+}
+
+// CLI 路径的白名单也必须认环境变量（与 serve 路径一致）。
+//
+// 历史缺口：TAIJI_ALLOW_TOOLS 只接在 serve 路径，CLI 只认 --allow-tool。
+// 后果：设了环境变量却在 CLI 里显示「白名单为空」——工具静默不可用。
+func TestRunChat_ReadsAllowToolsFromEnv(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	text := string(src)
+
+	start := indexOf(text, "func runChat(")
+	if start < 0 {
+		t.Fatal("runChat not found")
+	}
+	end := indexOf(text[start:], "\nfunc ")
+	if end < 0 {
+		end = len(text) - start
+	}
+	body := text[start : start+end]
+
+	if !contains(body, "envAllowTools()") {
+		t.Error("runChat 未读取 TAIJI_ALLOW_TOOLS——" +
+			"环境变量配了白名单却在 CLI 里静默失效")
 	}
 }
