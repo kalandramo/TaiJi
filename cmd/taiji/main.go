@@ -512,6 +512,12 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 		} else {
 			logf("用户级权限已启用")
 		}
+		// 打印主体 ID 前缀——否则用户不知道 TAIJI_USER_PERMISSIONS 的
+		// key 该写什么（workspace 段有兜底值 default，不显眼且易漏）。
+		// 格式与 pipeline 注入时用的完全一致（同一 workspaceID()）。
+		logf("主体 ID 前缀：%s:feishu: —— TAIJI_USER_PERMISSIONS 的 key "+
+			"应写成 <该前缀><用户open_id>，如 %s:feishu:ou_xxx=工具名",
+			workspaceID(loaded), workspaceID(loaded))
 	} else if len(toolSets) > 0 {
 		logf("提示：未配置 TAIJI_USER_PERMISSIONS —— 任何能触发 bot 的用户" +
 			"都可使用已放行的工具。若需按用户管控，请配置该变量。")
