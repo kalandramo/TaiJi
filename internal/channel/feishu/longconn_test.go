@@ -26,13 +26,21 @@ import (
 // 用 fake wsClient 验证，因为真实 WebSocket 需要真实飞书端点。
 
 // fakeWS 记录 Start/Close 的调用情况。
+//
+// **忠实模拟真实 SDK 的关键行为**：Start 永不返回。
+// 源码依据：larkws.Client.Start 末尾是裸 select{}（ws/client.go:206-232），
+// 它不观察 ctx，Close() 也不解除它的阻塞——Close 只是 disconnect socket。
+//
+// 早期版本的 fake 在 Close 时让 Start 返回，导致 Stop 里 `<-done` 的
+// 等待看起来正常，而真实进程会永久挂死（issue #9 Wave 6 实测：
+// Ctrl+C 后日志停在「正在关闭…」，socket 已断但进程不退出）。
+// 教训：fake 在关键维度上偏离真实行为时，测试反而会掩盖缺陷。
 type fakeWS struct {
 	startCalled int32
 	closeCalled int32
 	// block 让 Start 阻塞，模拟 SDK 的 select{}。
+	// **Close 不会关闭它**——Start 永不返回。
 	block chan struct{}
-	// startErr 是 Start 的返回值。
-	startErr error
 }
 
 func newFakeWS() *fakeWS {
@@ -41,14 +49,19 @@ func newFakeWS() *fakeWS {
 
 func (f *fakeWS) Start(ctx context.Context) error {
 	atomic.StoreInt32(&f.startCalled, 1)
-	// 模拟 SDK：**不观察 ctx**，只等 block 被关闭。
+	// 模拟 SDK 的裸 select{}：永久阻塞，不观察 ctx，Close 也不解除。
 	<-f.block
-	return f.startErr
+	return nil // 不可达：真实 SDK 下 select{} 永不返回
 }
 
 func (f *fakeWS) Close() {
 	atomic.StoreInt32(&f.closeCalled, 1)
-	// 关闭连接后 Start 才能返回——真实 SDK 里 disconnect 关掉底层 socket。
+	// 真实 SDK 的 Close 只 disconnect socket，**不让 Start 返回**。
+	// 此处刻意什么都不做——Start 会一直阻塞在 <-f.block。
+}
+
+// unblock 仅用于测试清理（释放 goroutine），不模拟 SDK 行为。
+func (f *fakeWS) unblock() {
 	select {
 	case <-f.block:
 	default:
@@ -143,44 +156,51 @@ func TestLongConn_CancelAloneDoesNotStop(t *testing.T) {
 	}
 }
 
-func TestLongConn_StopWaitsForStartGoroutine(t *testing.T) {
-	// Stop 返回后，Start 的 goroutine 必须已退出——否则测试/关闭流程
-	// 会出现「Stop 返回但后台仍在跑」的竞态。
+func TestLongConn_StopReturnsEvenThoughStartNeverDoes(t *testing.T) {
+	// **这是真实平台暴露的缺陷的回归护栏**（issue #9 Wave 6）。
+	//
+	// 源码事实：larkws.Client.Start 末尾是裸 select{}（ws/client.go:206-232），
+	// 永不返回；Close() 只 disconnect socket，不解除 select{}。
+	//
+	// 因此 Stop **绝不能等待 Start 的 goroutine**——那会永久挂死。
+	// 实测现象：Ctrl+C 后日志停在「收到中断信号，正在关闭…」，
+	// socket 已断（日志有 disconnected + use of closed network connection），
+	// 但进程不退出。
+	//
+	// 首版实现的 `<-l.done` 正是这个 bug；早期 fake 在 Close 时让 Start
+	// 返回，掩盖了它。
 	f := newFakeWS()
-	var goroutineDone int32
-	lc, err := NewLongConn(LongConnConfig{
-		AppID:     "a",
-		AppSecret: "b",
-		newClient: func(appID, appSecret string, handler *larkdispatcher.EventDispatcher) wsClient {
-			return &trackedWS{fake: f, done: &goroutineDone}
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewLongConn: %v", err)
-	}
+	lc := newTestLongConn(t, f, nil)
 
 	if err := lc.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	lc.Stop()
-
-	if atomic.LoadInt32(&goroutineDone) != 1 {
-		t.Error("Stop must wait for the Start goroutine to exit")
+	if !waitForCond(t, time.Second, f.started) {
+		t.Fatal("Start was not called")
 	}
-}
 
-// trackedWS 记录 Start 的退出。
-type trackedWS struct {
-	fake *fakeWS
-	done *int32
-}
+	// Stop 必须在有限时间内返回——否则进程无法退出。
+	done := make(chan struct{})
+	go func() {
+		lc.Stop()
+		close(done)
+	}()
 
-func (t *trackedWS) Start(ctx context.Context) error {
-	err := t.fake.Start(ctx)
-	atomic.StoreInt32(t.done, 1)
-	return err
+	select {
+	case <-done:
+		// 正确：Stop 不等待永不返回的 Start
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop hung waiting for Start's goroutine, which never returns " +
+			"(SDK's Start ends in bare select{}). The process would never exit.")
+	}
+
+	if !f.closed() {
+		t.Error("Stop must still call client.Close() to disconnect the socket")
+	}
+
+	// 清理：释放 fake 的 goroutine（真实 SDK 下它会一直阻塞到进程退出）
+	f.unblock()
 }
-func (t *trackedWS) Close() { t.fake.Close() }
 
 // ===== 生命周期幂等与非法状态 =====
 
@@ -343,19 +363,38 @@ func TestIncomingFromLongConnEvent_P2PUsesDirect(t *testing.T) {
 // ===== Start 错误传播 =====
 
 func TestLongConn_StartErrorRecorded(t *testing.T) {
-	f := newFakeWS()
-	f.startErr = errors.New("connect refused")
-	lc := newTestLongConn(t, f, nil)
+	// Start 的错误必须可查——SDK 在**连接失败**时会 `return err`
+	// （ws/client.go：connect 失败且不可重连时返回，不进入 select{}）。
+	//
+	// 用 failFastWS 模拟这条路径（连接失败 → Start 立即返回错误），
+	// 而非 fakeWS 的「连接成功 → 永久阻塞」。
+	f := &failFastWS{err: errors.New("connect refused")}
+	lc, err := NewLongConn(LongConnConfig{
+		AppID:     "a",
+		AppSecret: "b",
+		newClient: func(appID, appSecret string, handler *larkdispatcher.EventDispatcher) wsClient {
+			return f
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewLongConn: %v", err)
+	}
 
 	if err := lc.Start(context.Background()); err != nil {
 		t.Fatalf("Start (launch) must not fail synchronously: %v", err)
 	}
-	lc.Stop()
-
-	if err := lc.StartErr(); err == nil {
-		t.Error("Start's error must be recorded for inspection")
+	// 等 Start 的 goroutine 记录错误（它是异步的）
+	if !waitForCond(t, 2*time.Second, func() bool { return lc.StartErr() != nil }) {
+		t.Fatal("Start's error must be recorded for inspection")
 	}
+	lc.Stop()
 }
+
+// failFastWS 模拟「连接失败 → Start 立即返回错误」的 SDK 路径。
+type failFastWS struct{ err error }
+
+func (f *failFastWS) Start(ctx context.Context) error { return f.err }
+func (f *failFastWS) Close()                          {}
 
 // waitForCond 轮询等待条件成立。
 func waitForCond(t *testing.T, timeout time.Duration, cond func() bool) bool {

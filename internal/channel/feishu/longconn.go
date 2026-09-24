@@ -69,8 +69,6 @@ type LongConn struct {
 	mu      sync.Mutex
 	started bool
 	stopped bool
-	// done 在 Start 的 goroutine 退出时关闭，供 Stop 等待。
-	done chan struct{}
 	// startErr 保存 Start 的返回值（在 Stop 之后可读）。
 	startErr error
 }
@@ -107,7 +105,6 @@ func NewLongConn(cfg LongConnConfig) (*LongConn, error) {
 	return &LongConn{
 		cfg:    cfg,
 		client: cfg.newClient(cfg.AppID, cfg.AppSecret, d),
-		done:   make(chan struct{}),
 	}, nil
 }
 
@@ -130,7 +127,6 @@ func (l *LongConn) Start(ctx context.Context) error {
 	l.mu.Unlock()
 
 	go func() {
-		defer close(l.done)
 		err := l.client.Start(ctx)
 		l.mu.Lock()
 		l.startErr = err
@@ -142,13 +138,24 @@ func (l *LongConn) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop 真正关闭连接，并等待 Start 的 goroutine 退出。
+// Stop 断开连接。
 //
 // 这是 AC-6 的核心：**必须调用 client.Close()**，而不是只取消 ctx。
 // 源码依据：Start 末尾是裸 select{}，不观察 ctx；Close 才会
 // 设 autoReconnect=false 并 disconnect（ws/client.go:177-180）。
 // 只取消 ctx 会让 socket 存活并自动重连——正是 AC-6 要防的
 // 「留下存活 socket」。
+//
+// **不等 Start 的 goroutine**：Start 末尾是 `select{}`（ws/client.go:232），
+// 它**永不返回**，Close 也不解除它的阻塞。等待它 = 永久挂死。
+//
+// 实测教训（issue #9 Wave 6 真实平台验证）：首版实现用 `<-l.done` 等
+// Start 退出，Ctrl+C 后日志停在「收到中断信号，正在关闭…」——socket
+// 已断（日志有 disconnected + use of closed network connection），
+// 但进程不退出。早期单测的 fake 在 Close 时让 Start 返回，掩盖了该缺陷。
+//
+// 代价（明示）：Start 的 goroutine 会一直阻塞在 select{}，随进程退出
+// 由 OS 回收。这是 SDK 的设计约束（v3.9.7），无法在调用方消除。
 //
 // 幂等：重复调用安全。
 func (l *LongConn) Stop() {
@@ -158,19 +165,10 @@ func (l *LongConn) Stop() {
 		return
 	}
 	l.stopped = true
-	started := l.started
 	l.mu.Unlock()
 
-	// 先关闭连接——这会解除 Start 的阻塞（disconnect 让 select{} 退出？
-	// 实际上 select{} 永不退出，但 SDK 的 disconnect 会关闭底层 socket，
-	// 这正是 AC-6 要的「不留存活 socket」）。
+	// 断开 socket（AC-6 的实质）。不等待 Start goroutine——见上。
 	l.client.Close()
-
-	// 若 Start 已拉起，等它的 goroutine 结束，避免测试中出现
-	// 「Stop 返回后 goroutine 仍在跑」的竞态。
-	if started {
-		<-l.done
-	}
 }
 
 // StartErr 返回 Start 的返回值（Stop 之后才有意义）。
