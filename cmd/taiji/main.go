@@ -104,7 +104,7 @@ func runChat(args []string) int {
 	instruction := fs.String("instruction", "", "系统提示（可选）")
 	debug := fs.Bool("debug", false, "打印每轮调试信息（含多轮历史观察点）")
 	mcpSpecs := multiFlag{}
-	fs.Var(&mcpSpecs, "mcp", "挂载 MCP server，格式 name=command [args...]（可重复）")
+	fs.Var(&mcpSpecs, "mcp", "挂载 MCP server，格式 name=command [args...]（stdio）或 name=http(s)://host/path（远程，可重复）")
 	allowTools := multiFlag{}
 	fs.Var(&allowTools, "allow-tool", "放行的工具名（模型可见名，如 srvA_echo；可重复）。未列出的工具一律拒绝")
 	if err := fs.Parse(args); err != nil {
@@ -171,26 +171,100 @@ func (m *multiFlag) Set(v string) error {
 	return nil
 }
 
-// parseMCPSpecs 把 "name=command [args...]" 形式的 flag 解析成配置。
+// mcpHeadersPrefix 是 MCP 认证头的环境变量前缀。
+//
+// 格式：TAIJI_MCP_HEADERS_<SERVER名>=Header1:Value1;Header2:Value2
+// 例：  TAIJI_MCP_HEADERS_github=Authorization:Bearer ghp_xxx
+//
+// 为什么走环境变量而非 --config 工作区文件：这些头含 token/API key，属凭据。
+// 工作区是 agent 可写区域，落在那里的凭据可被改写（凭据劫持）。
+// config.ReservedPrefixes 锁住该前缀，工作区提供的同名键会被跳过。
+const mcpHeadersPrefix = "TAIJI_MCP_HEADERS_"
+
+// parseMCPSpecs 把 MCP server 配置解析成 MCPServerConfig。
+//
+// 支持的形态：
+//
+//	name=command [args...]            → stdio（本地子进程，无需认证）
+//	name=http://host/mcp              → streamable（远程，可带认证头）
+//	name=https://host/sse             → sse（远程，可带认证头）
+//
+// 远程形态的认证头从 TAIJI_MCP_HEADERS_<name> 读取（见 mcpHeadersPrefix）。
 func parseMCPSpecs(specs []string) ([]bootstrap.MCPServerConfig, error) {
 	out := make([]bootstrap.MCPServerConfig, 0, len(specs))
 	for _, s := range specs {
 		name, rest, ok := strings.Cut(s, "=")
 		if !ok {
-			return nil, fmt.Errorf("invalid --mcp %q: expected name=command [args...]", s)
+			return nil, fmt.Errorf("invalid MCP spec %q: expected name=command [args...] or name=url", s)
 		}
-		fields := strings.Fields(strings.TrimSpace(rest))
+		name = strings.TrimSpace(name)
+		rest = strings.TrimSpace(rest)
+
+		if strings.HasPrefix(rest, "http://") || strings.HasPrefix(rest, "https://") {
+			cfg := bootstrap.MCPServerConfig{
+				Name:      name,
+				Transport: mcpTransportForURL(rest),
+				URL:       rest,
+				Headers:   mcpHeadersFor(name),
+			}
+			out = append(out, cfg)
+			continue
+		}
+
+		fields := strings.Fields(rest)
 		if len(fields) == 0 {
-			return nil, fmt.Errorf("invalid --mcp %q: command is empty", s)
+			return nil, fmt.Errorf("invalid MCP spec %q: command is empty", s)
 		}
 		out = append(out, bootstrap.MCPServerConfig{
-			Name:      strings.TrimSpace(name),
+			Name:      name,
 			Transport: "stdio",
 			Command:   fields[0],
 			Args:      fields[1:],
 		})
 	}
 	return out, nil
+}
+
+// mcpTransportForURL 按 URL 形态推断 transport。
+//
+// 依据：MCP 的 SSE 端点约定以 /sse 结尾；其余按 streamable HTTP
+// （streamable 是 MCP 2025 规范推荐形态，作为默认更安全）。
+func mcpTransportForURL(u string) string {
+	if strings.HasSuffix(strings.TrimSuffix(u, "/"), "/sse") {
+		return "sse"
+	}
+	return "streamable"
+}
+
+// mcpHeadersFor 读取某 server 的认证头。
+//
+// 格式：Header1:Value1;Header2:Value2（分号分隔多项，冒号分隔名值）。
+// 值内的冒号保留（如 "Authorization:Bearer xxx" 切第一个冒号）。
+//
+// 只从**进程环境**读，不从 loaded 配置读——工作区可控的值不能进认证头。
+func mcpHeadersFor(serverName string) map[string]string {
+	raw := strings.TrimSpace(os.Getenv(mcpHeadersPrefix + serverName))
+	if raw == "" {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, item := range strings.Split(raw, ";") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(item, ":")
+		if !ok {
+			continue // 无冒号 → 不是合法头，跳过而非报错（避免启动失败）
+		}
+		if k = strings.TrimSpace(k); k != "" {
+			out[k] = strings.TrimSpace(v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func runServe(args []string) int {
@@ -414,6 +488,15 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 			"工具策略默认拒绝，所有工具调用都会被拒。请显式列出要放行的工具名"+
 			"（如 mockmcp_echo）。", len(toolSets))
 	}
+	// 远程 server 无认证头时提示：多数托管 MCP 服务要求 token，
+	// 缺失会以 401 形式在**调用时**才暴露，启动期提示更易定位。
+	for _, c := range mcpCfgs {
+		if c.Transport != "stdio" && len(c.Headers) == 0 {
+			logf("提示：MCP server %q 是远程（%s）但未配置认证头。"+
+				"若该服务要求 token，请设 %s%s=Authorization:Bearer <token>。",
+				c.Name, c.Transport, mcpHeadersPrefix, c.Name)
+		}
+	}
 	executor, err := chat.NewExecutor(chat.Options{
 		Config:     modelCfg,
 		AppName:    "taiji",
@@ -492,7 +575,10 @@ func workspaceID(loaded map[string]string) string {
 	return "default"
 }
 
-// envMCPSpecs 从环境读 MCP server 配置（分号分隔的 name=command 列表）。
+// envMCPSpecs 从环境读 MCP server 配置（分号分隔的 name=target 列表）。
+//
+// target 可以是本地命令（stdio）或 http(s) URL（远程）。
+// 远程 server 的认证头走 TAIJI_MCP_HEADERS_<name>（见 mcpHeadersPrefix）。
 func envMCPSpecs() []string {
 	v := strings.TrimSpace(os.Getenv("TAIJI_MCP_SERVERS"))
 	if v == "" {

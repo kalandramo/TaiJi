@@ -43,13 +43,32 @@ var CredentialKeys = map[string]struct{}{
 	"FEISHU_APP_SECRET": {},
 }
 
+// ReservedPrefixes 是按键**前缀**保护的集合。
+//
+// 与 ReservedKeys/CredentialKeys 的精确匹配不同，这里保护的是一族键——
+// 键名中含变量部分（如 server 名），无法静态枚举。
+//
+// TAIJI_MCP_HEADERS_<SERVER>：MCP 远程 server 的静态认证头（token/API key）。
+// 属凭据，与 CredentialKeys 同一威胁模型（被工作区覆盖 → 凭据劫持，
+// 攻击者可把 MCP server 的 token 换成自己已知的值）。
+var ReservedPrefixes = []string{
+	"TAIJI_MCP_HEADERS_",
+}
+
 // isReserved 判断键是否受保护（工作区不可提供）。
 func isReserved(key string) bool {
 	if _, ok := ReservedKeys[key]; ok {
 		return true
 	}
-	_, ok := CredentialKeys[key]
-	return ok
+	if _, ok := CredentialKeys[key]; ok {
+		return true
+	}
+	for _, p := range ReservedPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // MergeWorkspaceEnv 把工作区环境合并到受信基线上，返回新 map（不修改入参）。
