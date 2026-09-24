@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,9 +24,11 @@ import (
 	"time"
 
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
+	"github.com/kalandramo/TaiJi/internal/channel"
 	"github.com/kalandramo/TaiJi/internal/channel/feishu"
 	"github.com/kalandramo/TaiJi/internal/chat"
 	"github.com/kalandramo/TaiJi/internal/config"
+	"github.com/kalandramo/TaiJi/internal/server"
 )
 
 // signalContext 返回在收到中断信号时取消的 context，
@@ -221,11 +224,41 @@ func runServe(args []string) int {
 			feishu.EnvVerificationToken)
 	}
 
+	// ── 端到端管道装配（issue #9）──
+	// 把各层串起来：门禁 → 路由 → 串行化 → 执行 → 出站。
+	pipeline, err := buildPipeline(loaded, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "taiji serve: %v\n", err)
+		return 1
+	}
+	defer pipeline.Close()
+
+	// 异步分发：立即回 200，后台处理。去重抗飞书重投。
+	dispatcher, err := server.NewDispatcher(server.DispatcherConfig{
+		Handler: pipeline.Pipeline,
+		Deduper: channel.NewDeduper(channel.DefaultDedupTTL),
+		Logf:    func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "taiji serve: %v\n", err)
+		return 1
+	}
+
 	h := feishu.NewHandler(feishu.HandlerConfig{
 		Verify: verifyCfg,
-		// #5 只做入站：解析出的消息由 handler 打印（Demo path 的证据面）。
-		// OnMessage 留空——接入 agent 的端到端闭环由 #9 接线，
-		// 此处不塞空实现（空回调会让「已接线」与「未接线」在代码上无法区分）。
+		OnMessage: func(m *channel.IncomingMessage) error {
+			// 异步投递：**立即返回**，不阻塞 HTTP 响应。
+			//
+			// agent 跑一轮要数秒，远超飞书的事件响应窗口。同步处理会让
+			// 端点超时 → 平台重投 → 重复处理。正确形态是先回 200 再后台处理。
+			//
+			// 队列满时返回错误 → 端点回 500 → 平台重试。这比无界队列
+			// 吃光内存要好（见 server.Dispatcher 的文档）。
+			if err := dispatcher.Enqueue(m); err != nil {
+				return err
+			}
+			return nil
+		},
 	})
 
 	mux := http.NewServeMux()
@@ -264,10 +297,15 @@ func runServe(args []string) int {
 		fmt.Fprintln(os.Stderr, "\ntaiji serve: 收到中断信号，正在关闭…")
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelShutdown()
+		// 顺序：先停 HTTP（不再收新请求），再停分发器（等在途消息处理完）。
+		// 反过来的话，Shutdown 期间到达的请求会被投进已关闭的队列。
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			fmt.Fprintf(os.Stderr, "taiji serve: 关闭失败: %v\n", err)
 			return 1
 		}
+		// HTTP 已停，等在途消息处理完再退出——否则已回 200 的消息被静默丢弃。
+		dispatcher.Stop()
+		fmt.Fprintln(os.Stderr, "taiji serve: 已关闭")
 	}
 	return 0
 }
@@ -289,4 +327,153 @@ func printControlValues(cfg map[string]string) {
 		}
 		fmt.Fprintf(os.Stderr, "  %s=%s\n", k, v)
 	}
+}
+
+// ── 端到端管道装配（issue #9）──
+
+// pipelineHolder 持有管道与执行器，统一释放。
+//
+// 执行器（chat.Executor）持有长驻 runner，其 session service 承载多轮历史
+// ——必须跨消息复用（见 chat.Executor 的文档），故它的生命周期与进程一致。
+type pipelineHolder struct {
+	Pipeline *server.Pipeline
+	executor *chat.Executor
+}
+
+func (h *pipelineHolder) Close() {
+	if h == nil || h.executor == nil {
+		return
+	}
+	h.executor.Close()
+}
+
+// buildPipeline 装配端到端管道。
+//
+// 配置来源分两类（设计文档 §4.6）：
+//   - 模型配置：受信启动环境（TAIJI_MODEL_*），可由工作区文件覆盖非保留键
+//   - 渠道凭据：只从受信环境（FEISHU_APP_ID/APP_SECRET），工作区不得覆盖
+func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, error) {
+	logf := func(format string, args ...any) {
+		fmt.Fprintf(logw, "[pipeline] "+format+"\n", args...)
+	}
+
+	// 模型装配：与 chat 子命令同源。
+	modelCfg := bootstrap.ModelConfigFromEnv()
+	if v, ok := loaded[bootstrap.EnvModelName]; ok && v != "" {
+		modelCfg.Name = v
+	}
+	if v, ok := loaded[bootstrap.EnvModelBaseURL]; ok {
+		modelCfg.BaseURL = v
+	}
+
+	// MCP 工具集（可选）：未配置则不挂工具。
+	// 端到端验收线要求「回答涉及工具调用时，工具结果体现在最终回复里」。
+	mcpCfgs, err := parseMCPSpecs(envMCPSpecs())
+	if err != nil {
+		return nil, fmt.Errorf("解析 MCP 配置: %w", err)
+	}
+	toolSets, err := bootstrap.NewMCPSets(mcpCfgs)
+	if err != nil {
+		return nil, fmt.Errorf("装配 MCP: %w", err)
+	}
+
+	// 出站：需要应用凭据换 tenant_access_token。
+	sender, err := feishu.NewSender(feishu.SenderConfigFromEnv(loaded))
+	if err != nil {
+		bootstrap.CloseMCPSets(toolSets)
+		return nil, err
+	}
+
+	// 执行器：长驻，跨消息共享 session（多轮历史的前提）。
+	executor, err := chat.NewExecutor(chat.Options{
+		Config:   modelCfg,
+		AppName:  "taiji",
+		UserID:   "feishu",
+		ToolSets: toolSets,
+		Echo:     logw,
+	})
+	if err != nil {
+		bootstrap.CloseMCPSets(toolSets)
+		return nil, fmt.Errorf("装配执行器: %w", err)
+	}
+
+	p, err := server.New(server.Config{
+		Sender:   sender,
+		Executor: executor,
+		Gate:     gateConfigFromEnv(),
+		Route: channel.RouteConfig{
+			WorkspaceID: workspaceID(loaded),
+			// 群聊按话题分流（§4.4.4 的 thread_map）；单聊无话题概念。
+			BindingMode: channel.BindingThreadMap,
+		},
+		Logf: logf,
+	})
+	if err != nil {
+		executor.Close()
+		bootstrap.CloseMCPSets(toolSets)
+		return nil, err
+	}
+	return &pipelineHolder{Pipeline: p, executor: executor}, nil
+}
+
+// gateConfigFromEnv 从受信环境读门禁配置。
+//
+// 默认值取向是 fail-closed：未配置 activation 时按 when_mentioned
+// （群聊必须 @ 才响应），而不是 always——后者会让 bot 在群里对每条消息
+// 都插话。私聊不受 @ 约束（门禁第 2 步放行）。
+func gateConfigFromEnv() server.GateConfig {
+	activation := channel.ActivationWhenMentioned
+	switch os.Getenv("TAIJI_FEISHU_ACTIVATION") {
+	case "always":
+		activation = channel.ActivationAlways
+	case "disabled":
+		activation = channel.ActivationDisabled
+	}
+	audience := channel.AudienceEveryone
+	if os.Getenv("TAIJI_FEISHU_AUDIENCE") == "owner_only" {
+		audience = channel.AudienceOwnerOnly
+	}
+	var owners []string
+	if v := strings.TrimSpace(os.Getenv("TAIJI_FEISHU_OWNERS")); v != "" {
+		for _, s := range strings.Split(v, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				owners = append(owners, s)
+			}
+		}
+	}
+	return server.GateConfig{
+		Activation: activation,
+		Audience:   audience,
+		// botOpenID 是 @ 判定的基准。未配置时群聊会被 fail-closed 拒绝
+		// （门禁第 4 步）——这是刻意的：宁可拒绝也不能静默放行。
+		BotOpenID: strings.TrimSpace(os.Getenv("TAIJI_FEISHU_BOT_OPEN_ID")),
+		Owners:    owners,
+	}
+}
+
+// workspaceID 返回串行化域与路由用的 workspace 标识。
+func workspaceID(loaded map[string]string) string {
+	if v := strings.TrimSpace(os.Getenv("TAIJI_WORKSPACE_ID")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(loaded["WORKSPACE_NAME"]); v != "" {
+		return v
+	}
+	return "default"
+}
+
+// envMCPSpecs 从环境读 MCP server 配置（分号分隔的 name=command 列表）。
+func envMCPSpecs() []string {
+	v := strings.TrimSpace(os.Getenv("TAIJI_MCP_SERVERS"))
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
