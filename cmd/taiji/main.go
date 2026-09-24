@@ -196,6 +196,7 @@ func parseMCPSpecs(specs []string) ([]bootstrap.MCPServerConfig, error) {
 func runServe(args []string) int {
 	fs, cfg := newFlagSet("serve", "启动渠道服务")
 	addr := fs.String("addr", ":8080", "监听地址")
+	mode := fs.String("feishu-mode", "webhook", "接入形态：webhook（默认，需公网 URL）| longconn（长连接，只需出网）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -242,6 +243,17 @@ func runServe(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "taiji serve: %v\n", err)
 		return 1
+	}
+
+	// ── 长连接模式（issue #9 Wave 5，AC-6）──
+	// 长连接无需验签（信任来自 SDK 与飞书的 TLS 通道，§2.2），
+	// 也无需公网入口——只需出网。适用于内网部署与本地开发。
+	if *mode == "longconn" {
+		return runLongConn(loaded, pipeline, dispatcher)
+	}
+	if *mode != "webhook" {
+		fmt.Fprintf(os.Stderr, "taiji serve: 未知 --feishu-mode=%q（支持 webhook | longconn）\n", *mode)
+		return 2
 	}
 
 	h := feishu.NewHandler(feishu.HandlerConfig{
@@ -476,4 +488,57 @@ func envMCPSpecs() []string {
 		}
 	}
 	return out
+}
+
+// runLongConn 以长连接模式运行（issue #9 Wave 5，AC-6）。
+//
+// 与 webhook 模式的关键差异：
+//   - 无 HTTP 端点、无验签（§2.2：长连接不需要 verificationToken/encryptKey）
+//   - 入站由 SDK 回调直出，投递给同一个 dispatcher（去重 + 异步处理）
+//   - 关闭必须调 LongConn.Stop() → SDK 的 Close()。**只取消 ctx 不够**：
+//     larkws.Client.Start 末尾是裸 select{}（ws/client.go:206-232），
+//     不观察 ctx，socket 会存活并自动重连（AC-6 要防的正是这个）。
+func runLongConn(loaded map[string]string, pipeline *pipelineHolder, dispatcher *server.Dispatcher) int {
+	senderCfg := feishu.SenderConfigFromEnv(loaded)
+	if senderCfg.AppID == "" || senderCfg.AppSecret == "" {
+		fmt.Fprintf(os.Stderr,
+			"taiji serve: 长连接模式需要 %s 与 %s（凭据只从启动环境读，见设计文档 §4.6）。\n",
+			feishu.EnvAppID, feishu.EnvAppSecret)
+		return 1
+	}
+
+	lc, err := feishu.NewLongConn(feishu.LongConnConfig{
+		AppID:     senderCfg.AppID,
+		AppSecret: senderCfg.AppSecret,
+		// 入站复用同一套去重 + 异步分发——两条入站路径的
+		// 下游行为必须一致，否则语义会因入口不同而分叉。
+		OnMessage: dispatcher.Enqueue,
+		Logf:      func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "taiji serve: %v\n", err)
+		return 1
+	}
+
+	ctx, cancel := signalContext()
+	defer cancel()
+
+	if err := lc.Start(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "taiji serve: 启动长连接失败: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(os.Stderr, "taiji serve: 长连接已启动（无需公网入口）")
+
+	<-ctx.Done()
+	fmt.Fprintln(os.Stderr, "\ntaiji serve: 收到中断信号，正在关闭…")
+
+	// 顺序：先停长连接（不再收新消息）→ 再停分发器（等在途处理完）。
+	// Stop 内部调 SDK 的 Close()，真正断开 socket（AC-6）。
+	lc.Stop()
+	if err := lc.StartErr(); err != nil {
+		fmt.Fprintf(os.Stderr, "taiji serve: 长连接异常退出: %v\n", err)
+	}
+	dispatcher.Stop()
+	fmt.Fprintln(os.Stderr, "taiji serve: 已关闭")
+	return 0
 }
