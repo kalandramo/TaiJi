@@ -2,7 +2,10 @@ package authz
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"strings"
 )
 
 // 主体解析与 owner 判定（issue #6，设计文档 §4.4.5）。
@@ -38,6 +41,47 @@ type Principal struct {
 
 // Valid 表示该主体可用于权限判定（有 ID 才能比对 owner）。
 func (p Principal) Valid() bool { return p.ID != "" }
+
+// redactHashLen 是脱敏摘要的长度（SHA-256 前 8 个 hex 字符）。
+//
+// 8 字符 = 32 bit，对"日志里区分用户"足够（同部署的用户数远小于
+// 碰撞阈值），且短到不影响可读性。
+const redactHashLen = 8
+
+// Redacted 返回可安全落日志的主体标识。
+//
+// open_id 是用户隐私标识，不应进日志；但日志又需要能区分不同用户
+// （审计、排障）。折中：保留渠道段（不含隐私，且是排障必需上下文），
+// 只对最后一段做不可逆摘要。
+//
+//	{workspace}:{platform}:{open_id}
+//	  → {workspace}:{platform}:{sha256 前 8 位}
+//
+// 特性：
+//   - 不可逆（无法从摘要还原 open_id）
+//   - 稳定（同一主体每次得到同一摘要 → 日志可关联）
+//   - 可区分（不同主体摘要不同）
+//   - 定长（不泄漏原 ID 长度）
+//
+// 形态异常（段数不足 3）时整串摘要——宁可不保留上下文，也不泄漏原文。
+// 空主体返回空串（不构造"匿名用户"这类假标识）。
+func (p Principal) Redacted() string {
+	if !p.Valid() {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(p.ID))
+	digest := hex.EncodeToString(sum[:])[:redactHashLen]
+
+	// 期望形态 {workspace}:{platform}:{open_id}
+	parts := strings.Split(p.ID, ":")
+	if len(parts) < 3 {
+		// 形态异常：整串摘要，不保留任何原文片段
+		return digest
+	}
+	// 保留前两段，只摘要最后一段（open_id）
+	head := strings.Join(parts[:len(parts)-1], ":")
+	return head + ":" + digest
+}
 
 // PrincipalInput 是主体解析的输入。
 //

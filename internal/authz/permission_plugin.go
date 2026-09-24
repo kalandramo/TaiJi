@@ -64,7 +64,7 @@ func (p *PrincipalPolicyPlugin) beforeTool() tool.BeforeToolCallbackStructured {
 
 		if p.source == nil {
 			p.log("denied: no permission source configured (principal=%s tool=%s)",
-				principal.ID, args.ToolName)
+				principal.Redacted(), args.ToolName)
 			return denyResult("权限未配置，已拒绝该操作。"), nil
 		}
 
@@ -73,15 +73,15 @@ func (p *PrincipalPolicyPlugin) beforeTool() tool.BeforeToolCallbackStructured {
 			// 查不了 ≠ 不允许。两者都拒，但日志必须区分——
 			// 否则数据源故障会被误读为权限收紧。
 			p.log("denied: permission source unavailable (principal=%s tool=%s err=%v)",
-				principal.ID, args.ToolName, err)
+				principal.Redacted(), args.ToolName, err)
 			return denyResult("权限校验暂时不可用，请稍后重试。"), nil
 		}
 		if !allowed {
-			p.log("denied: not permitted (principal=%s tool=%s)", principal.ID, args.ToolName)
+			p.log("denied: not permitted (principal=%s tool=%s)", principal.Redacted(), args.ToolName)
 			return denyResult(fmt.Sprintf("你没有使用该工具（%s）的权限。", args.ToolName)), nil
 		}
 
-		p.log("allowed: principal=%s tool=%s", principal.ID, args.ToolName)
+		p.log("allowed: principal=%s tool=%s", principal.Redacted(), args.ToolName)
 		return nil, nil // 放行
 	}
 }
