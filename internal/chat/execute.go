@@ -9,6 +9,7 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/plugin"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 
 	"github.com/kalandramo/TaiJi/internal/authz"
@@ -191,7 +192,20 @@ func newRunner(opts Options) (*assembly, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := runner.NewRunner(opts.AppName, ag, runner.WithPlugins(policy.Plugin()))
+
+	// 插件按序串联，各管一个维度：
+	//   approval         部署级——哪些工具在本部署启用（装配期定死）
+	//   principalPolicy  用户级——谁能用哪些工具（读 ctx 里的 Principal）
+	//
+	// 两个都要：部署级防止"未启用的工具被调用"，用户级防止"越权使用"。
+	// 顺序上部署级在前——它判定更便宜（纯内存查表），且被它拒的工具
+	// 无需再走用户级查询。
+	plugins := []plugin.Plugin{policy.Plugin()}
+	if opts.Permissions != nil {
+		plugins = append(plugins, authz.NewPrincipalPolicyPlugin(opts.Permissions, opts.logf))
+	}
+
+	r := runner.NewRunner(opts.AppName, ag, runner.WithPlugins(plugins...))
 	return &assembly{runner: r, agent: ag, policy: policy, opts: opts}, nil
 }
 

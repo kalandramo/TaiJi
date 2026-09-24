@@ -18,6 +18,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 
+	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
 )
 
@@ -34,7 +35,18 @@ type Options struct {
 	// AllowTools 是工具白名单（issue #4）。空表示全部拒绝（安全基线）。
 	// 名字必须是「模型可见名」——MCP 工具要写 srvA_echo 而非 echo。
 	// 装配期会校验名字是否已注册，未注册即报错（AC-4）。
+	//
+	// 这是**部署级**策略：哪些工具在本部署启用。
 	AllowTools []string
+	// Permissions 是**用户级**权限源（方案 A：静态配置）。
+	//
+	// 与 AllowTools 串联，各管一个维度：
+	//   AllowTools   部署级——工具是否在本部署启用（装配期校验）
+	//   Permissions  用户级——该用户能否用这个工具（每次调用时判定）
+	//
+	// nil 表示不做用户级判定（向后兼容：CLI 等单用户场景）。
+	// 非 nil 时，未授权用户的工具调用会被拒（fail-closed）。
+	Permissions authz.PermissionSource
 	// Out 接收模型输出（默认 stdout 由调用方传入）。
 	Out io.Writer
 	// Echo 接收提示与状态（默认 stderr）。
@@ -46,6 +58,16 @@ type Options struct {
 	// （整段内容在 Message.Content 而非 Delta.Content）。
 	// 生产不应设置——原型默认走流式。
 	ForceNonStream bool
+}
+
+// logf 把日志写到 Echo（未设置则丢弃）。
+//
+// 用途：用户级权限的拒绝必须留痕——否则"按用户管控"会在无声中失效。
+func (o Options) logf(format string, args ...any) {
+	if o.Echo == nil {
+		return
+	}
+	fmt.Fprintf(o.Echo, "[perm] "+format+"\n", args...)
 }
 
 // Run 启动交互循环，直到 EOF 或用户输入 exit/quit。

@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
 	"github.com/kalandramo/TaiJi/internal/channel"
 	"github.com/kalandramo/TaiJi/internal/channel/feishu"
@@ -155,6 +156,7 @@ func runChat(args []string) int {
 		Instruction: *instruction,
 		ToolSets:    toolSets,
 		AllowTools:  append(envAllowTools(), allowTools...),
+		Permissions: envPermissions(),
 		Out:         os.Stdout,
 		Echo:        os.Stderr,
 		Debug:       *debug,
@@ -502,13 +504,27 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 		}
 	}
 
+	// 用户级权限（方案 A：静态配置）。未配置时为 nil —— 不做用户级判定。
+	permissions := envPermissions()
+	if permissions != nil {
+		if sp, ok := permissions.(*authz.StaticPermissions); ok {
+			logf("用户级权限已启用（%d 个主体）", sp.PrincipalCount())
+		} else {
+			logf("用户级权限已启用")
+		}
+	} else if len(toolSets) > 0 {
+		logf("提示：未配置 TAIJI_USER_PERMISSIONS —— 任何能触发 bot 的用户" +
+			"都可使用已放行的工具。若需按用户管控，请配置该变量。")
+	}
+
 	executor, err := chat.NewExecutor(chat.Options{
-		Config:     modelCfg,
-		AppName:    "taiji",
-		UserID:     "feishu",
-		ToolSets:   toolSets,
-		AllowTools: allowTools,
-		Echo:       logw,
+		Config:      modelCfg,
+		AppName:     "taiji",
+		UserID:      "feishu",
+		ToolSets:    toolSets,
+		AllowTools:  allowTools,
+		Permissions: permissions,
+		Echo:        logw,
 	})
 	if err != nil {
 		bootstrap.CloseMCPSets(toolSets)
@@ -719,4 +735,47 @@ func registeredToolNamesHint(cfgs []bootstrap.MCPServerConfig) []string {
 		return nil
 	}
 	return serverNames(cfgs)
+}
+
+// envPermissions 从环境读用户级权限表（方案 A：静态配置）。
+//
+// 格式：条目用分号分隔，主体与工具列表用等号分隔，工具用逗号分隔。
+//
+//	TAIJI_USER_PERMISSIONS="ws1:feishu:ou_alice=mockmcp_echo,infraverse_*;ws1:feishu:ou_admin=*"
+//
+// 主体 ID 形态为 {workspace}:{platform}:{open_id}（见 authz.ResolvePrincipal），
+// 与管道注入的形态一致。工具名支持 "*" 与 "prefix_*" 通配。
+//
+// 返回 nil 表示未配置——此时不做用户级判定（向后兼容）。
+// 配置了但解析出空表 → 返回空表（拒绝一切），与"未配置"语义不同。
+func envPermissions() authz.PermissionSource {
+	raw := strings.TrimSpace(os.Getenv("TAIJI_USER_PERMISSIONS"))
+	if raw == "" {
+		return nil
+	}
+	table := make(map[string][]string)
+	for _, entry := range strings.Split(raw, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		principal, tools, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue // 无 = 的条目跳过（不因一处笔误导致启动失败）
+		}
+		principal = strings.TrimSpace(principal)
+		if principal == "" {
+			continue
+		}
+		var list []string
+		for _, t := range strings.Split(tools, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				list = append(list, t)
+			}
+		}
+		if len(list) > 0 {
+			table[principal] = list
+		}
+	}
+	return authz.NewStaticPermissions(table)
 }

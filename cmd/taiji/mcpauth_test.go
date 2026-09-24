@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
 	"github.com/kalandramo/TaiJi/internal/config"
 )
@@ -398,5 +400,75 @@ func TestRunChat_ReadsAllowToolsFromEnv(t *testing.T) {
 	if !contains(body, "envAllowTools()") {
 		t.Error("runChat 未读取 TAIJI_ALLOW_TOOLS——" +
 			"环境变量配了白名单却在 CLI 里静默失效")
+	}
+}
+
+// ===== 6. 用户级权限表解析（方案 A）=====
+
+func TestEnvPermissions_AbsentIsNil(t *testing.T) {
+	t.Setenv("TAIJI_USER_PERMISSIONS", "")
+	if got := envPermissions(); got != nil {
+		t.Errorf("未配置时应返回 nil（不做用户级判定），got %v", got)
+	}
+}
+
+func TestEnvPermissions_ParsesEntries(t *testing.T) {
+	t.Setenv("TAIJI_USER_PERMISSIONS",
+		"ws1:feishu:ou_alice=mockmcp_echo,infraverse_*;ws1:feishu:ou_admin=*")
+
+	src := envPermissions()
+	if src == nil {
+		t.Fatal("应返回权限源")
+	}
+
+	ctx := context.Background()
+	cases := []struct {
+		principal string
+		tool      string
+		want      bool
+	}{
+		{"ws1:feishu:ou_alice", "mockmcp_echo", true},
+		{"ws1:feishu:ou_alice", "infraverse_dce_ip", true},
+		{"ws1:feishu:ou_alice", "other_tool", false},
+		{"ws1:feishu:ou_admin", "anything", true},
+		{"ws1:feishu:ou_unknown", "mockmcp_echo", false},
+	}
+	for _, c := range cases {
+		got, err := src.Allowed(ctx, authz.Principal{Type: "im_user", ID: c.principal}, c.tool)
+		if err != nil {
+			t.Fatalf("Allowed(%s,%s): %v", c.principal, c.tool, err)
+		}
+		if got != c.want {
+			t.Errorf("Allowed(%s, %s) = %v, want %v", c.principal, c.tool, got, c.want)
+		}
+	}
+}
+
+func TestEnvPermissions_SkipsMalformedEntries(t *testing.T) {
+	// 无 = 的条目跳过，不影响合法条目（一处笔误不导致启动失败）
+	t.Setenv("TAIJI_USER_PERMISSIONS", "garbage;ws1:feishu:ou_alice=mockmcp_echo")
+	src := envPermissions()
+	if src == nil {
+		t.Fatal("合法条目应被解析")
+	}
+	ok, _ := src.Allowed(context.Background(),
+		authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, "mockmcp_echo")
+	if !ok {
+		t.Error("合法条目应生效")
+	}
+}
+
+func TestEnvPermissions_WhitespaceTolerated(t *testing.T) {
+	t.Setenv("TAIJI_USER_PERMISSIONS", "  ws1:feishu:ou_alice = mockmcp_echo , mockmcp_other  ")
+	src := envPermissions()
+	ok, _ := src.Allowed(context.Background(),
+		authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, "mockmcp_echo")
+	if !ok {
+		t.Error("应容忍空白")
+	}
+	ok2, _ := src.Allowed(context.Background(),
+		authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, "mockmcp_other")
+	if !ok2 {
+		t.Error("第二个工具也应生效")
 	}
 }
