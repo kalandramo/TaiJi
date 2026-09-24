@@ -1,0 +1,245 @@
+package chat
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
+
+	"github.com/kalandramo/TaiJi/internal/authz"
+	"github.com/kalandramo/TaiJi/internal/bootstrap"
+)
+
+// 单轮执行 API（issue #9 Wave 2）。
+//
+// 为什么需要它：CLI 的 Run 是**交互循环**（bufio.Scanner + exit/quit），
+// 服务端（飞书 webhook / 长连接）需要的是「给一句输入，拿完整回答」。
+// 把「循环」与「单轮」拆开，两者复用同一套事件流语义——角色判定、
+// 工具调用轮次、终止信号。否则两处各写一遍，语义必然漂移。
+//
+// 分工：
+//   - chat.go 的 Run：CLI 循环，逐块打印（保留打字机效果）
+//   - 本文件的 Executor：单轮，聚合完整回答（服务端一次性发送）
+//   - 两者共用 runOneTurn 内核
+
+// ErrBlankInput 表示输入为空或仅空白。
+//
+// 空输入在飞书侧会在门禁前被拦，但本 API 也要 fail-fast：
+// 发起一次模型调用去问空问题既是浪费，也会让下游收到空回答后
+// 往飞书发一条空消息。
+var ErrBlankInput = errors.New("chat: input is blank")
+
+// Executor 持有长驻的 runner，供服务端跨消息复用。
+//
+// **为什么必须是长驻的**（实测发现的架构约束）：runner 持有 session service
+// （runner.go:390 默认 inmemory）。每次新建 runner 就得到一份全新的
+// session 存储——同一 SessionID 的历史无法延续，「第二条消息看到第一条
+// 上下文」（AC-3）直接失效。
+//
+// 探针证据：两次独立装配各跑一轮 → 模型收到的消息数 [1 1]（历史丢失）；
+// 同一个 runner 连跑两轮 → [1 1 1 3]（第二轮 3 条，历史保留）。
+//
+// 所以服务端必须在启动时装配一次 Executor，而不是每条消息调一次 Execute。
+type Executor struct {
+	asm *assembly
+}
+
+// NewExecutor 装配一个长驻执行器。服务端启动时调用一次。
+func NewExecutor(opts Options) (*Executor, error) {
+	asm, err := newRunner(opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Executor{asm: asm}, nil
+}
+
+// Close 释放 runner 资源。服务端退出时调用。
+func (e *Executor) Close() {
+	if e != nil {
+		e.asm.Close()
+	}
+}
+
+// Execute 执行单轮：发消息 → 消费事件流 → 返回完整回答。
+//
+// 与 Run 的区别：不读 stdin、不处理 exit、不逐块写 Out。
+// 回答以字符串返回，由调用方决定如何投递（飞书用「占位 → 更新」两步）。
+//
+// ctx 取消会让本次执行提前结束并返回错误——服务端在进程退出时
+// 依赖这条路径让在途请求收尾。
+func (e *Executor) Execute(ctx context.Context, input string) (string, error) {
+	text := strings.TrimSpace(input)
+	if text == "" {
+		return "", ErrBlankInput
+	}
+
+	var sb strings.Builder
+	if err := runOneTurn(ctx, e.asm.runner, e.asm.opts, text, func(chunk string) {
+		sb.WriteString(chunk)
+	}); err != nil {
+		return "", err
+	}
+	return sb.String(), nil
+}
+
+// assembly 是一次装配的产物。
+//
+// 把 policy 与 agent 一起返回，是为了让「打印策略提示」不必重建 agent——
+// 重建既浪费（要再走一遍工具注册）又会引入不一致（两次装配结果可能不同）。
+type assembly struct {
+	runner runner.Runner
+	agent  *llmagent.LLMAgent
+	policy *authz.ToolPolicy
+	opts   Options
+}
+
+// newModel 构建模型 provider。
+func newModel(opts Options) (model.Model, error) {
+	return bootstrap.NewModel(opts.Config)
+}
+
+// newAgent 构建 agent。装配细节与 CLI 完全一致。
+func newAgent(opts Options, m model.Model) (*llmagent.LLMAgent, error) {
+	agentOpts := []llmagent.Option{
+		llmagent.WithModel(m),
+		// 必须显式开启流式：llmagent 默认走非流式（整段返回），
+		// 那样「逐块输出」无从谈起（issue #2 AC-1）。
+		// ForceNonStream 仅用于测试非流式回退路径。
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: !opts.ForceNonStream}),
+	}
+	if s := strings.TrimSpace(opts.Instruction); s != "" {
+		agentOpts = append(agentOpts, llmagent.WithInstruction(s))
+	}
+	if len(opts.ToolSets) > 0 {
+		// 挂载工具集：llmagent 会用 NamedToolSet 包装，把工具名变成
+		// {toolSetName}_{originalName}（见 trpc internal/tool/toolset.go:251），
+		// 从而避免多个 MCP server 的同名工具冲突（issue #3 AC-2）。
+		agentOpts = append(agentOpts, llmagent.WithToolSets(opts.ToolSets))
+	}
+	return llmagent.New("assistant", agentOpts...), nil
+}
+
+// newToolPolicy 构建工具策略（issue #4：默认拒绝 + 白名单放行）。
+//
+// 必须在 agent 建好之后装配——AC-4 的校验要用 agent 暴露的
+// 「模型可见工具名」（MCP 工具带 {server}_ 前缀），而非原始 ToolSet 的裸名。
+func newToolPolicy(opts Options, ag *llmagent.LLMAgent) (*authz.ToolPolicy, error) {
+	return authz.BuildToolPolicy(authz.ToolPolicyConfig{
+		Allow:      opts.AllowTools,
+		Registered: ag.Tools(),
+	})
+}
+
+// newRunner 装配一次运行所需的 runner 及关联组件。
+//
+// 抽出来是为了让 Run 与 Executor 用**完全相同**的装配路径——
+// 模型、agent 选项、工具策略任何一处不同，CLI 与服务端的行为就会分叉，
+// 而这类分叉很难在测试里被发现。
+func newRunner(opts Options) (*assembly, error) {
+	m, err := newModel(opts)
+	if err != nil {
+		return nil, err
+	}
+	ag, err := newAgent(opts, m)
+	if err != nil {
+		return nil, err
+	}
+	policy, err := newToolPolicy(opts, ag)
+	if err != nil {
+		return nil, err
+	}
+	r := runner.NewRunner(opts.AppName, ag, runner.WithPlugins(policy.Plugin()))
+	return &assembly{runner: r, agent: ag, policy: policy, opts: opts}, nil
+}
+
+// Close 释放 runner 资源。
+func (a *assembly) Close() {
+	if a != nil && a.runner != nil {
+		a.runner.Close()
+	}
+}
+
+// printToolPolicyHint 打印工具策略生效情况。
+//
+// CLI 打印是为了避免「配了工具却都不能用」的困惑。
+func (a *assembly) printToolPolicyHint(opts Options) {
+	if opts.Echo == nil {
+		return
+	}
+	if len(opts.AllowTools) > 0 {
+		fmt.Fprintf(opts.Echo, "工具策略：默认拒绝，放行 %v\n", a.policy.AllowedTools())
+	} else if n := len(a.agent.Tools()); n > 0 {
+		fmt.Fprintf(opts.Echo, "工具策略：默认拒绝，白名单为空——%d 个已注册工具均不可执行\n", n)
+	}
+}
+
+// runOneTurn 执行一轮并把正文块交给 emit。
+//
+// 这是 Run 与 Executor 的共用内核：角色判定、非流式回退、终止信号
+// 只在这里实现一次。emit 为 nil 表示只关心是否有输出（不逐块消费）。
+func runOneTurn(ctx context.Context, r runner.Runner, opts Options, input string, emit func(string)) error {
+	msg := model.NewUserMessage(input)
+
+	events, err := r.Run(ctx, opts.UserID, opts.SessionID, msg)
+	if err != nil {
+		// 此处 err 是 session/agent 选择类的同步错误，不含网络失败——
+		// 模型连接错误走事件流（下方 ev.IsError()），其文本已由 provider
+		// 注入请求 URL（实测：401 与连接拒绝均含完整 URL），故无需再包装。
+		return err
+	}
+
+	printed := 0
+	for ev := range events {
+		if ev == nil {
+			continue
+		}
+		if ev.IsError() {
+			return fmt.Errorf("model error: %v", ev.Error)
+		}
+
+		// 增量文本：streaming 下内容在 Choices[0].Delta.Content。
+		// 非流式回退：整段在 Choices[0].Message.Content（一次性输出）。
+		//
+		// 只取 assistant 角色的正文：工具调用链中，tool 角色的消息承载
+		// 工具返回值，它是给模型看的中间产物，不是给用户的回答。若不区分
+		// 角色，工具结果会被当作正文重复打印（issue #3 实测发现）。
+		//
+		// 只取 Choices[0]：未请求多候选（未设 GenerationConfig.N），
+		// 所有主流 provider 默认 n=1。若将来启用多候选，此处需改为遍历
+		// 并明确各候选的输出策略（否则其余候选会被静默丢弃）。
+		if ev.Response != nil && len(ev.Choices) > 0 {
+			ch := ev.Choices[0]
+			if isAssistantText(ch.Delta.Role) {
+				if delta := ch.Delta.Content; delta != "" {
+					if emit != nil {
+						emit(delta)
+					}
+					printed += len(delta)
+				}
+			}
+			// 非流式回退：整段在 Message.Content，仅在尚未输出过时使用。
+			if printed == 0 && isAssistantText(ch.Message.Role) {
+				if full := ch.Message.Content; full != "" {
+					if emit != nil {
+						emit(full)
+					}
+					printed += len(full)
+				}
+			}
+		}
+
+		// v1.11.2 的终止信号是 runner completion（不是 IsFinalResponse）
+		if ev.IsRunnerCompletion() {
+			break
+		}
+	}
+
+	if opts.Debug {
+		fmt.Fprintf(opts.Echo, "\n[debug] 本轮输出 %d 字节\n", printed)
+	}
+	return nil
+}

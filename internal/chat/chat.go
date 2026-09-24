@@ -14,12 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 
-	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
 )
 
@@ -43,6 +41,11 @@ type Options struct {
 	Echo io.Writer
 	// Debug 为真时打印每轮请求的消息条数（AC-3 多轮验证的观察点）。
 	Debug bool
+
+	// ForceNonStream 关闭流式，用于验证非流式回退路径
+	// （整段内容在 Message.Content 而非 Delta.Content）。
+	// 生产不应设置——原型默认走流式。
+	ForceNonStream bool
 }
 
 // Run 启动交互循环，直到 EOF 或用户输入 exit/quit。
@@ -63,50 +66,15 @@ func Run(ctx context.Context, in io.Reader, opts Options) error {
 		opts.SessionID = fmt.Sprintf("cli-%d", time.Now().Unix())
 	}
 
-	m, err := bootstrap.NewModel(opts.Config)
+	// 装配走 execute.go 的共用路径——CLI 与服务端必须用完全相同的
+	// 模型/agent/工具策略装配，否则两者行为分叉且难以在测试中发现。
+	asm, err := newRunner(opts)
 	if err != nil {
 		return err
 	}
+	defer asm.Close()
 
-	agentOpts := []llmagent.Option{
-		llmagent.WithModel(m),
-		// 必须显式开启流式：llmagent 默认走非流式（整段返回），
-		// 那样 AC-1 的"逐块输出"无从谈起。
-		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: true}),
-	}
-	if s := strings.TrimSpace(opts.Instruction); s != "" {
-		agentOpts = append(agentOpts, llmagent.WithInstruction(s))
-	}
-	if len(opts.ToolSets) > 0 {
-		// 挂载工具集：llmagent 会用 NamedToolSet 包装，把工具名变成
-		// {toolSetName}_{originalName}（见 trpc internal/tool/toolset.go:251），
-		// 从而避免多个 MCP server 的同名工具冲突（issue #3 AC-2）。
-		agentOpts = append(agentOpts, llmagent.WithToolSets(opts.ToolSets))
-	}
-	ag := llmagent.New("assistant", agentOpts...)
-
-	// 工具策略（issue #4）：默认拒绝 + 白名单放行。
-	// 必须在 agent 建好之后装配——AC-4 的校验要用 agent 暴露的
-	// 「模型可见工具名」（MCP 工具带 {server}_ 前缀），而非原始 ToolSet 的裸名。
-	policy, err := authz.BuildToolPolicy(authz.ToolPolicyConfig{
-		Allow:      opts.AllowTools,
-		Registered: ag.Tools(),
-	})
-	if err != nil {
-		return err
-	}
-
-	runnerOpts := []runner.Option{runner.WithPlugins(policy.Plugin())}
-	r := runner.NewRunner(opts.AppName, ag, runnerOpts...)
-	defer r.Close()
-
-	if len(opts.AllowTools) > 0 {
-		fmt.Fprintf(opts.Echo, "工具策略：默认拒绝，放行 %v\n", policy.AllowedTools())
-	} else if len(ag.Tools()) > 0 {
-		// 有工具但无白名单：全部会被拒。显式提示，避免"配了工具却都不能用"的困惑。
-		fmt.Fprintf(opts.Echo, "工具策略：默认拒绝，白名单为空——%d 个已注册工具均不可执行\n",
-			len(ag.Tools()))
-	}
+	asm.printToolPolicyHint(opts)
 
 	fmt.Fprintf(opts.Echo, "taiji chat · model=%s session=%s\n输入 exit 退出。\n\n",
 		opts.Config.Name, opts.SessionID)
@@ -127,7 +95,7 @@ func Run(ctx context.Context, in io.Reader, opts Options) error {
 			break
 		}
 
-		if err := oneTurn(ctx, r, opts, line); err != nil {
+		if err := oneTurn(ctx, asm.runner, opts, line); err != nil {
 			// 单轮失败不终止会话，打印后继续（除非是致命错误）
 			fmt.Fprintf(opts.Echo, "\n[error] %v\n\n", err)
 		}
@@ -136,64 +104,14 @@ func Run(ctx context.Context, in io.Reader, opts Options) error {
 	return scanner.Err()
 }
 
-// oneTurn 执行一轮：发消息 → 消费事件流 → 打印增量文本。
+// oneTurn 执行一轮：发消息 → 消费事件流 → 逐块写入 Out。
+//
+// CLI 保留逐块输出（打字机效果）。服务端用 Execute（聚合完整回答）。
+// 两者的差异只在 emit 回调，事件流语义共用 runOneTurn。
 func oneTurn(ctx context.Context, r runner.Runner, opts Options, input string) error {
-	msg := model.NewUserMessage(input)
-
-	events, err := r.Run(ctx, opts.UserID, opts.SessionID, msg)
-	if err != nil {
-		// 此处 err 是 session/agent 选择类的同步错误，不含网络失败——
-		// 模型连接错误走事件流（下方 ev.IsError()），其文本已由 provider
-		// 注入请求 URL（实测：401 与连接拒绝均含完整 URL），故无需再包装。
-		return err
-	}
-
-	var printed strings.Builder
-	for ev := range events {
-		if ev == nil {
-			continue
-		}
-		if ev.IsError() {
-			return fmt.Errorf("model error: %v", ev.Error)
-		}
-
-		// 增量文本：streaming 下内容在 Choices[0].Delta.Content。
-		// 非流式回退：整段在 Choices[0].Message.Content（一次性输出）。
-		//
-		// 只打印 assistant 角色的正文：工具调用链中，tool 角色的消息承载
-		// 工具返回值，它是给模型看的中间产物，不是给用户的回答。若不区分
-		// 角色，工具结果会被当作正文重复打印（issue #3 实测发现）。
-		//
-		// 只取 Choices[0]：CLI 场景未请求多候选（未设 GenerationConfig.N），
-		// 所有主流 provider 默认 n=1。若将来启用多候选，此处需改为遍历
-		// 并明确各候选的输出策略（否则其余候选会被静默丢弃）。
-		if ev.Response != nil && len(ev.Choices) > 0 {
-			ch := ev.Choices[0]
-			if isAssistantText(ch.Delta.Role) {
-				if delta := ch.Delta.Content; delta != "" {
-					fmt.Fprint(opts.Out, delta)
-					printed.WriteString(delta)
-				}
-			}
-			// 非流式回退：整段在 Message.Content，仅在尚未输出过时使用。
-			if printed.Len() == 0 && isAssistantText(ch.Message.Role) {
-				if full := ch.Message.Content; full != "" {
-					fmt.Fprint(opts.Out, full)
-					printed.WriteString(full)
-				}
-			}
-		}
-
-		// v1.11.2 的终止信号是 runner completion（不是 IsFinalResponse）
-		if ev.IsRunnerCompletion() {
-			break
-		}
-	}
-
-	if opts.Debug {
-		fmt.Fprintf(opts.Echo, "\n[debug] 本轮输出 %d 字节\n", printed.Len())
-	}
-	return nil
+	return runOneTurn(ctx, r, opts, input, func(chunk string) {
+		fmt.Fprint(opts.Out, chunk)
+	})
 }
 
 // isAssistantText 判断该角色承载的是"给用户看的正文"。
