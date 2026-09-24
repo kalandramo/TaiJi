@@ -59,9 +59,9 @@ type eventMessage struct {
 }
 
 type eventMention struct {
-	Key  string       `json:"key"`
-	Name string       `json:"name"`
-	ID   *mentionID   `json:"id"`
+	Key  string     `json:"key"`
+	Name string     `json:"name"`
+	ID   *mentionID `json:"id"`
 }
 
 type mentionID struct {

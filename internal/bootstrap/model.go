@@ -15,8 +15,8 @@ import (
 
 // 配置来源的环境变量名。控制值来自受信启动环境（设计文档 §4.6）。
 const (
-	EnvModelName   = "TAIJI_MODEL_NAME"
-	EnvModelAPIKey = "TAIJI_MODEL_API_KEY"
+	EnvModelName    = "TAIJI_MODEL_NAME"
+	EnvModelAPIKey  = "TAIJI_MODEL_API_KEY"
 	EnvModelBaseURL = "TAIJI_MODEL_BASE_URL"
 )
 
