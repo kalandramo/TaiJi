@@ -1,6 +1,9 @@
 package authz
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // 主体解析与 owner 判定（issue #6，设计文档 §4.4.5）。
 //
@@ -89,4 +92,56 @@ func IsOwner(owners []string, senderID string) bool {
 		}
 	}
 	return false
+}
+
+// ── 身份上下文（飞书用户身份贯通）──
+//
+// 动机：open_id 目前只到门禁为止——管道用 msg.UserID 做 owner 判定
+// （server/pipeline.go 的 GateInput.SenderID），但执行层拿不到提问人是谁。
+// 工具策略因此无法按用户区分（见 toolpolicy.go 的装配期白名单）。
+//
+// 贯通方式：管道把身份注入 runCtx，框架会把该 ctx 透传到工具回调
+// （已实测验证：beforeTool 能读到注入值）。下游（工具策略、审计日志）
+// 据此按用户判定。
+//
+// 与 ContextKind 的分工：ContextKind 管"这次执行能做什么"（来源维度），
+// Principal 管"这是谁"（身份维度）。两者正交，可同时存在。
+
+type principalCtxKey struct{}
+
+// WithPrincipal 把主体身份注入上下文。
+//
+// 注入空主体（ID 为空）等价于未注入——PrincipalFrom 会返回 ok=false。
+// 这样调用方无需自行判空。
+func WithPrincipal(ctx context.Context, p Principal) context.Context {
+	if ctx == nil || !p.Valid() {
+		return ctx
+	}
+	return context.WithValue(ctx, principalCtxKey{}, p)
+}
+
+// PrincipalFrom 读取主体身份。第二个返回值为 false 表示无身份。
+//
+// **调用方必须把 false 当 fail-closed 信号**，不得"当作匿名用户放行"——
+// 无身份时权限判定失去依据，放行等于敞开。
+func PrincipalFrom(ctx context.Context) (Principal, bool) {
+	if ctx == nil {
+		return Principal{}, false
+	}
+	p, ok := ctx.Value(principalCtxKey{}).(Principal)
+	if !ok || !p.Valid() {
+		return Principal{}, false
+	}
+	return p, true
+}
+
+// SenderIDFrom 返回主体的发送者 ID（owner 比对用的形态）。
+//
+// 无身份时返回空串——调用方据此 fail-closed（IsOwner 对空串恒返回 false）。
+func SenderIDFrom(ctx context.Context) string {
+	p, ok := PrincipalFrom(ctx)
+	if !ok {
+		return ""
+	}
+	return p.ID
 }

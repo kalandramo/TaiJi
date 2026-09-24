@@ -156,6 +156,29 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 	// 无法可靠判定个人角色，故渠道来源的写操作一律拒绝。
 	runCtx := authz.WithContextKind(ctx, authz.KindChannel)
 
+	// 身份注入：把发送者身份放进 runCtx，供下游按用户判定。
+	//
+	// 为什么在这里：msg.UserID 来自平台元数据（飞书 sender.open_id，
+	// 见 feishu/parse.go 的 extractOpenID），是**不可伪造**的身份源——
+	// 不由调用方参数决定。门禁已用它做 owner 判定，此处让执行层也能读到。
+	//
+	// 框架会把该 ctx 透传到工具回调（beforeTool），故工具策略可据此
+	// 按用户判定。实测验证见 internal/server/principal_e2e_test.go。
+	//
+	// 身份缺失时不注入（WithPrincipal 对空主体是 no-op）——下游
+	// PrincipalFrom 返回 ok=false，调用方须据此 fail-closed。
+	runCtx = authz.WithPrincipal(runCtx, authz.ResolvePrincipal(authz.PrincipalInput{
+		ChannelID: p.route.WorkspaceID,
+		Platform:  string(msg.Platform),
+		OpenID:    msg.UserID,
+	}))
+	if _, ok := authz.PrincipalFrom(runCtx); !ok {
+		// 身份缺失不阻断执行（向后兼容：CLI 等无渠道身份的场景），
+		// 但必须留痕——否则"按用户管控"会在无声中失效。
+		p.logf("server: principal missing message_id=%s platform=%s（下游无法按用户判定）",
+			msg.MessageID, msg.Platform)
+	}
+
 	// 先发占位消息，拿到 message_id 供后续更新（§4.4.1 的简化版流式）。
 	receiver, idType := receiverOf(msg)
 	placeholderID, err := p.sender.SendMessage(runCtx, receiver, p.placeholder, channel.SendOptions{
