@@ -67,7 +67,7 @@ type echoExecutor struct {
 	seen []string
 }
 
-func (e *echoExecutor) Execute(ctx context.Context, input string) (string, error) {
+func (e *echoExecutor) Execute(ctx context.Context, sessionID, input string) (string, error) {
 	e.mu.Lock()
 	e.seen = append(e.seen, input)
 	e.mu.Unlock()
@@ -375,7 +375,7 @@ func TestE2E_HTTPRespondsWithoutWaitingForAgent(t *testing.T) {
 
 type slowExecutor struct{ delay time.Duration }
 
-func (s *slowExecutor) Execute(ctx context.Context, input string) (string, error) {
+func (s *slowExecutor) Execute(ctx context.Context, sessionID, input string) (string, error) {
 	select {
 	case <-time.After(s.delay):
 	case <-ctx.Done():

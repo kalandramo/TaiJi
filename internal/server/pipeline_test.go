@@ -68,18 +68,21 @@ func (f *fakeSender) count() int {
 
 // fakeExecutor 记录所有执行调用，并可注入延迟/错误。
 type fakeExecutor struct {
-	mu    sync.Mutex
-	runs  []string
-	err   error
-	delay time.Duration
+	mu   sync.Mutex
+	runs []string
+	// sessions 记录每次执行收到的 sessionID（AC-3 的会话隔离断言）。
+	sessions []string
+	err      error
+	delay    time.Duration
 	// events 记录 enter/exit，用于断言串行化。
 	events []string
 }
 
-func (f *fakeExecutor) Execute(ctx context.Context, input string) (string, error) {
+func (f *fakeExecutor) Execute(ctx context.Context, sessionID, input string) (string, error) {
 	f.mu.Lock()
 	f.events = append(f.events, "enter:"+input)
 	f.runs = append(f.runs, input)
+	f.sessions = append(f.sessions, sessionID)
 	f.mu.Unlock()
 
 	if f.delay > 0 {
@@ -105,6 +108,12 @@ func (f *fakeExecutor) runCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.runs)
+}
+
+func (f *fakeExecutor) sessionList() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.sessions...)
 }
 
 func (f *fakeExecutor) eventList() []string {
@@ -142,6 +151,52 @@ func directMsg(text string) *channel.IncomingMessage {
 		ChatType:  channel.ChatDirect,
 		MessageID: "om_1",
 		Content:   text,
+	}
+}
+
+// ===== AC-3：会话隔离（sessionID 必须按会话区分） =====
+
+func TestPipeline_SessionIDIsPerConversation(t *testing.T) {
+	// 真实平台验证暴露的缺陷（issue #9 Wave 6）：Executor 收到的 sessionID
+	// 为空，trpc 报 "sessionID is required"，每条消息都失败。
+	//
+	// 修法不只是「给个非空值」——sessionID 必须是 **per-conversation** 的：
+	// 同一会话的两条消息要共享历史（AC-3 后半），不同会话必须隔离。
+	// 路由结果里的 effectiveJID 正是天然的会话键。
+	sender := &fakeSender{}
+	ex := &fakeExecutor{}
+	p := testPipeline(t, sender, ex)
+
+	// 同一会话两条
+	for i := 0; i < 2; i++ {
+		if err := p.Handle(context.Background(), directMsg("hi")); err != nil {
+			t.Fatalf("Handle %d: %v", i, err)
+		}
+	}
+	// 另一个会话一条（不同 chatID）
+	other := directMsg("hi")
+	other.UserID = "ou_another"
+	if err := p.Handle(context.Background(), other); err != nil {
+		t.Fatalf("Handle other: %v", err)
+	}
+
+	sessions := ex.sessionList()
+	if len(sessions) != 3 {
+		t.Fatalf("executor calls = %d, want 3", len(sessions))
+	}
+	// 非空
+	for i, s := range sessions {
+		if s == "" {
+			t.Fatalf("call %d got empty sessionID — trpc would reject it", i)
+		}
+	}
+	// 同会话共享
+	if sessions[0] != sessions[1] {
+		t.Errorf("same conversation must share a session: %q vs %q", sessions[0], sessions[1])
+	}
+	// 不同会话隔离
+	if sessions[0] == sessions[2] {
+		t.Errorf("different conversations must NOT share a session: both = %q", sessions[0])
 	}
 }
 
@@ -332,7 +387,7 @@ type recordingExecutor struct {
 	kind string
 }
 
-func (r *recordingExecutor) Execute(ctx context.Context, input string) (string, error) {
+func (r *recordingExecutor) Execute(ctx context.Context, sessionID, input string) (string, error) {
 	if k, ok := authz.ContextKindFrom(ctx); ok {
 		r.kind = string(k)
 	}

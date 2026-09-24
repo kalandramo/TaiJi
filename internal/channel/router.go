@@ -100,6 +100,32 @@ func ResolveThread(meta *ChannelMessageMeta) *NativeThreadContext {
 	}
 }
 
+// localSessionID 决定会话标识的本地部分。
+//
+// 群聊用 ChatID（群即会话）。私聊的 ChatID 为空（inbound.go:79），
+// 此时必须用 UserID——否则**所有私聊用户会共用同一个会话**
+// （`feishu:ws1#`），历史互相串话。
+//
+// 这是真实平台验证暴露的缺陷（issue #9 Wave 6）：单用户测试时
+// 表现正常，多用户才暴露，属典型「测试覆盖盲区」。
+//
+// 两者都空时返回哨兵而非空串：空串会让会话键退化成裸 workspace 前缀，
+// 让所有此类消息静默撞进同一会话。哨兵使这种畸形输入在审计中可见。
+func localSessionID(in *IncomingMessage) string {
+	if in.ChatID != "" {
+		return in.ChatID
+	}
+	if in.UserID != "" {
+		return in.UserID
+	}
+	// 既无会话 ID 又无主体 ID——无法安全路由。
+	// 用消息 ID 兜底（至少保证不与他人撞车），仍空则用固定哨兵。
+	if in.MessageID != "" {
+		return "unrouted:" + in.MessageID
+	}
+	return "unrouted:anonymous"
+}
+
 // ResolveRoute 构造会话标识。
 //
 // base 形如 {channelPrefix}{workspaceId}#{chatId}；话题消息追加话题后缀。
@@ -107,7 +133,7 @@ func ResolveRoute(cfg RouteConfig, in *IncomingMessage) RouteTarget {
 	if in == nil {
 		return RouteTarget{}
 	}
-	base := ChannelPrefix(in.Platform) + cfg.WorkspaceID + "#" + in.ChatID
+	base := ChannelPrefix(in.Platform) + cfg.WorkspaceID + "#" + localSessionID(in)
 
 	// 保守判定：三个条件缺一不可。任一不满足即走普通会话。
 	if in.ChatType == ChatGroup && cfg.BindingMode == BindingThreadMap && in.Meta != nil && in.Meta.NativeContextType == nativeContextThread {

@@ -30,8 +30,13 @@ import (
 // 在**消费方**（本包）定义接口，而非在 chat 包导出具体类型——
 // 这样管道测试可以注入 fake，不必起真实的模型端点。
 // chat.Executor 天然满足它（方法集一致）。
+//
+// sessionID 是**会话级**标识（管道传路由后的 effectiveJID）：
+// 同一会话的消息共享历史（AC-3 后半），不同会话互相隔离。
+// 传空值会被实现拒绝——漏传 sessionID 是装配缺陷，显式失败优于
+// 让所有会话共用一份历史（静默串话）。
 type Executor interface {
-	Execute(ctx context.Context, input string) (string, error)
+	Execute(ctx context.Context, sessionID, input string) (string, error)
 }
 
 // GateConfig 是门禁的静态配置部分（每次判定不变的量）。
@@ -160,7 +165,16 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 		return fmt.Errorf("server: send placeholder: %w", err)
 	}
 
-	answer, execErr := p.executor.Execute(runCtx, msg.Content)
+	// 执行。
+	//
+	// sessionID 用 effectiveJID：它含渠道前缀与 workspace，天然是会话级
+	// 唯一键。同一会话的消息共享历史（AC-3 后半），不同会话互相隔离。
+	//
+	// **实测教训**（issue #9 Wave 6 真实平台验证）：此处最初传空值，
+	// trpc 报 "sessionID is required"，每条消息都失败。当时错误地以为
+	// sessionID 该由装配层统一设置——但它是 per-conversation 的，
+	// 必须在路由之后才能确定。
+	answer, execErr := p.executor.Execute(runCtx, target.EffectiveJID, msg.Content)
 
 	// ── 5. 出站 ──
 	// 无论执行成功与否都要更新占位消息——否则用户会看到一条永远「思考中…」

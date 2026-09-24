@@ -74,6 +74,55 @@ func TestResolveRoute_SameChannelSameChatSharesSession(t *testing.T) {
 	}
 }
 
+// ===== 私聊会话键：必须含用户身份 =====
+
+func TestResolveRoute_DirectChatKeysByUser(t *testing.T) {
+	// 真实平台验证暴露的缺陷（issue #9 Wave 6）：私聊的 chat_id 为空
+	// （inbound.go:79），而 ResolveRoute 用 ChatID 构造会话键——
+	// 于是**所有私聊用户共用同一个会话**，历史互相串话。
+	//
+	// 修法：私聊时用 UserID 作为会话键（私聊的「会话」就是「这个人」）。
+	cfg := RouteConfig{WorkspaceID: "ws1", BindingMode: BindingThreadMap}
+
+	alice := &IncomingMessage{
+		Platform: PlatformFeishu, UserID: "ou_alice",
+		ChatType: ChatDirect, // chat_id 为空
+	}
+	bob := &IncomingMessage{
+		Platform: PlatformFeishu, UserID: "ou_bob",
+		ChatType: ChatDirect,
+	}
+
+	ra := ResolveRoute(cfg, alice)
+	rb := ResolveRoute(cfg, bob)
+
+	if ra.EffectiveJID == rb.EffectiveJID {
+		t.Fatalf("different direct-chat users must not share a session: both = %q", ra.EffectiveJID)
+	}
+	if ra.EffectiveJID != "feishu:ws1#ou_alice" {
+		t.Errorf("alice jid = %q, want feishu:ws1#ou_alice", ra.EffectiveJID)
+	}
+	// 同一用户的两条消息仍须共享会话
+	ra2 := ResolveRoute(cfg, alice)
+	if ra2.EffectiveJID != ra.EffectiveJID {
+		t.Errorf("same user must share a session: %q vs %q", ra.EffectiveJID, ra2.EffectiveJID)
+	}
+}
+
+func TestResolveRoute_DirectChatWithoutUserIDFailsClosed(t *testing.T) {
+	// 私聊既无 ChatID 又无 UserID → 会话键会退化成 "feishu:ws1#"，
+	// 让所有此类消息撞进同一会话。这类消息无法安全路由，
+	// 应产出可识别的哨兵值而非静默共用会话。
+	cfg := RouteConfig{WorkspaceID: "ws1", BindingMode: BindingThreadMap}
+	in := &IncomingMessage{
+		Platform: PlatformFeishu, ChatType: ChatDirect,
+	}
+	got := ResolveRoute(cfg, in)
+	if got.EffectiveJID == "feishu:ws1#" {
+		t.Errorf("direct chat with no id must not collapse to the bare workspace key, got %q", got.EffectiveJID)
+	}
+}
+
 // ===== AC-2：话题隔离（Demo path ②） =====
 
 func TestResolveRoute_ThreadsAreIsolated(t *testing.T) {

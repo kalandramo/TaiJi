@@ -95,8 +95,7 @@ func Run(ctx context.Context, in io.Reader, opts Options) error {
 			break
 		}
 
-		if err := oneTurn(ctx, asm.runner, opts, line); err != nil {
-			// 单轮失败不终止会话，打印后继续（除非是致命错误）
+		if err := oneTurn(ctx, asm.runner, opts, line); err != nil { // 单轮失败不终止会话，打印后继续（除非是致命错误）
 			fmt.Fprintf(opts.Echo, "\n[error] %v\n\n", err)
 		}
 		fmt.Fprintln(opts.Out)
@@ -106,10 +105,13 @@ func Run(ctx context.Context, in io.Reader, opts Options) error {
 
 // oneTurn 执行一轮：发消息 → 消费事件流 → 逐块写入 Out。
 //
-// CLI 保留逐块输出（打字机效果）。服务端用 Execute（聚合完整回答）。
+// CLI 保留逐块输出（打字机效果）。服务端用 Executor.Execute（聚合完整回答）。
 // 两者的差异只在 emit 回调，事件流语义共用 runOneTurn。
+//
+// CLI 用 opts.SessionID（Run 已确保非空——空则补 cli-<ts>）：
+// CLI 只有一个交互会话，不像服务端需要 per-conversation 的键。
 func oneTurn(ctx context.Context, r runner.Runner, opts Options, input string) error {
-	return runOneTurn(ctx, r, opts, input, func(chunk string) {
+	return runOneTurn(ctx, r, opts, opts.SessionID, input, func(chunk string) {
 		fmt.Fprint(opts.Out, chunk)
 	})
 }

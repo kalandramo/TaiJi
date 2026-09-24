@@ -33,6 +33,12 @@ import (
 // 往飞书发一条空消息。
 var ErrBlankInput = errors.New("chat: input is blank")
 
+// ErrMissingSessionID 表示调用方未提供会话标识。
+//
+// 服务端必须传会话级标识（如路由后的 effectiveJID）——漏传是装配缺陷，
+// 显式失败优于静默让所有会话共用一份历史。
+var ErrMissingSessionID = errors.New("chat: sessionID is required")
+
 // Executor 持有长驻的 runner，供服务端跨消息复用。
 //
 // **为什么必须是长驻的**（实测发现的架构约束）：runner 持有 session service
@@ -66,19 +72,29 @@ func (e *Executor) Close() {
 
 // Execute 执行单轮：发消息 → 消费事件流 → 返回完整回答。
 //
-// 与 Run 的区别：不读 stdin、不处理 exit、不逐块写 Out。
-// 回答以字符串返回，由调用方决定如何投递（飞书用「占位 → 更新」两步）。
+// sessionID 决定历史归属：同一 sessionID 的多轮会带上彼此的历史，
+// 不同 sessionID 互相隔离。调用方（服务端）应传**会话级**的稳定标识
+// （如路由后的 effectiveJID），而不是每次生成新值——否则历史无法延续。
+//
+// 空 sessionID 返回错误而非补默认值：CLI 的 Run 会补 cli-<ts>（因为它
+// 只有单一交互会话），但服务端漏传 sessionID 是**装配缺陷**——补默认值
+// 会让所有会话共用一个历史（互相串话），且这个错误很难被发现。
+// 实测教训：真实平台首次运行即报 "sessionID is required"（trpc 拒绝空值），
+// 正是这条校验把它从「静默串话」变成了「显式失败」。
 //
 // ctx 取消会让本次执行提前结束并返回错误——服务端在进程退出时
 // 依赖这条路径让在途请求收尾。
-func (e *Executor) Execute(ctx context.Context, input string) (string, error) {
+func (e *Executor) Execute(ctx context.Context, sessionID, input string) (string, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return "", ErrMissingSessionID
+	}
 	text := strings.TrimSpace(input)
 	if text == "" {
 		return "", ErrBlankInput
 	}
 
 	var sb strings.Builder
-	if err := runOneTurn(ctx, e.asm.runner, e.asm.opts, text, func(chunk string) {
+	if err := runOneTurn(ctx, e.asm.runner, e.asm.opts, sessionID, text, func(chunk string) {
 		sb.WriteString(chunk)
 	}); err != nil {
 		return "", err
@@ -181,10 +197,13 @@ func (a *assembly) printToolPolicyHint(opts Options) {
 //
 // 这是 Run 与 Executor 的共用内核：角色判定、非流式回退、终止信号
 // 只在这里实现一次。emit 为 nil 表示只关心是否有输出（不逐块消费）。
-func runOneTurn(ctx context.Context, r runner.Runner, opts Options, input string, emit func(string)) error {
+//
+// sessionID 由调用方传入而非从 opts 读——服务端需要 per-conversation
+// 的会话键（路由结果），而 CLI 只有一个固定会话。
+func runOneTurn(ctx context.Context, r runner.Runner, opts Options, sessionID, input string, emit func(string)) error {
 	msg := model.NewUserMessage(input)
 
-	events, err := r.Run(ctx, opts.UserID, opts.SessionID, msg)
+	events, err := r.Run(ctx, opts.UserID, sessionID, msg)
 	if err != nil {
 		// 此处 err 是 session/agent 选择类的同步错误，不含网络失败——
 		// 模型连接错误走事件流（下方 ev.IsError()），其文本已由 provider

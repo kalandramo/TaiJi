@@ -45,7 +45,7 @@ func TestExecute_ReturnsFullAnswer(t *testing.T) {
 	srv, _ := mockSSE(t, []string{"你好", "，", "世界"})
 
 	ex := newTestExecutor(t, testOptions(srv.URL, &sseRecorder{}))
-	got, err := ex.Execute(context.Background(), "hi")
+	got, err := ex.Execute(context.Background(), "sess-1", "hi")
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestExecutor_MultiTurnCarriesHistory(t *testing.T) {
 
 	ex := newTestExecutor(t, testOptions(srv.URL, &sseRecorder{}))
 	for i := 0; i < 2; i++ {
-		if _, err := ex.Execute(context.Background(), "问题"); err != nil {
+		if _, err := ex.Execute(context.Background(), "sess-1", "问题"); err != nil {
 			t.Fatalf("Execute %d: %v", i, err)
 		}
 	}
@@ -92,7 +92,7 @@ func TestExecute_NonStreamFallback(t *testing.T) {
 	opts.ForceNonStream = true
 	ex := newTestExecutor(t, opts)
 
-	got, err := ex.Execute(context.Background(), "hi")
+	got, err := ex.Execute(context.Background(), "sess-1", "hi")
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestExecute_EmptyInputRejected(t *testing.T) {
 	srv, msgCounts := mockSSE(t, []string{"x"})
 
 	ex := newTestExecutor(t, testOptions(srv.URL, &sseRecorder{}))
-	_, err := ex.Execute(context.Background(), "   ")
+	_, err := ex.Execute(context.Background(), "sess-1", "   ")
 	if err == nil {
 		t.Fatal("blank input must be rejected")
 	}
@@ -122,7 +122,7 @@ func TestExecute_PropagatesModelError(t *testing.T) {
 	srv := brokenSSE(t)
 
 	ex := newTestExecutor(t, testOptions(srv, &sseRecorder{}))
-	_, err := ex.Execute(context.Background(), "hi")
+	_, err := ex.Execute(context.Background(), "sess-1", "hi")
 	if err == nil {
 		t.Fatal("model error must propagate, not become an empty answer")
 	}
