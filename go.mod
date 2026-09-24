@@ -2,7 +2,10 @@ module github.com/kalandramo/TaiJi
 
 go 1.27.1
 
-require trpc.group/trpc-go/trpc-agent-go v1.11.2
+require (
+	github.com/larksuite/oapi-sdk-go/v3 v3.9.7
+	trpc.group/trpc-go/trpc-agent-go v1.11.2
+)
 
 require (
 	github.com/bmatcuk/doublestar/v4 v4.9.1 // indirect
