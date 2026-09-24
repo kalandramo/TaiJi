@@ -43,11 +43,11 @@ type DispatcherConfig struct {
 	Deduper *channel.Deduper
 	// QueueSize 是待处理队列容量。<=0 用 DefaultQueueSize。
 	QueueSize int
-	// Workers 是并发消费者数。<=0 用 DefaultWorkers。
+	// Workers 是并发消费者数。仅支持 1。
 	//
-	// 注意：并发消费者不会破坏「同会话串行」——串行化由
-	// Pipeline 内的 Serializer 保证（按 workspace 域互斥）。
-	// 这里的并发只让不同域的消息并行处理。
+	// >1 会在 NewDispatcher 被拒绝（而非静默接受）——多 worker 破坏
+	// 同会话顺序，见 DefaultWorkers 的说明。显式失败优于让调用方
+	// 以为提升了吞吐、实际引入了乱序缺陷。
 	Workers int
 	// Logf 是日志出口。
 	Logf func(format string, args ...any)
@@ -61,7 +61,23 @@ type DispatcherConfig struct {
 const DefaultQueueSize = 64
 
 // DefaultWorkers 是默认消费者数。
-const DefaultWorkers = 4
+//
+// **必须是 1**——这不是保守取值，而是正确性要求。
+//
+// 多 worker 会破坏同会话的消息顺序：N 个 worker 并发从队列取消息，
+// 谁先抢到 Pipeline 的串行化域是不确定的。串行化器本身是 FIFO 的，
+// 但它只保证「已到达 AcquireBlocking 的调用者」之间的顺序——
+// 两个 worker 之间谁先调用它，取决于 goroutine 调度。
+//
+// 后果：用户连发「第一句」「第二句」，可能第二句先执行，于是
+// 「第二条看到第一条上下文」（AC-3）变成历史颠倒。
+//
+// 实测证据：workers=4 时 TestE2E_SequentialMessagesInSameSession
+// 10 次跑出 4 次失败（execution order = [第二句 第一句]）。
+//
+// 若要提升吞吐，正确做法是按会话键分片到固定 worker（同一会话恒由
+// 同一 worker 处理），而不是简单加 worker 数。原型不需要该复杂度。
+const DefaultWorkers = 1
 
 // Dispatcher 把消息投递与处理解耦。
 type Dispatcher struct {
@@ -93,6 +109,13 @@ func NewDispatcher(cfg DispatcherConfig) (*Dispatcher, error) {
 	workers := cfg.Workers
 	if workers <= 0 {
 		workers = DefaultWorkers
+	}
+	// 拒绝 >1：多 worker 破坏同会话顺序（见 DefaultWorkers 说明）。
+	// fail-closed 而非静默降到 1——静默降级会让调用方以为并发已生效。
+	if workers > 1 {
+		return nil, fmt.Errorf(
+			"server: Workers=%d not supported (must be 1): multiple consumers "+
+				"break per-session message ordering (see DefaultWorkers)", workers)
 	}
 	logf := cfg.Logf
 	if logf == nil {

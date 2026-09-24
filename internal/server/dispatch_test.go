@@ -258,7 +258,9 @@ func TestDispatcher_ConcurrentEnqueueAllProcessed(t *testing.T) {
 		Handler:   h,
 		Deduper:   channel.NewDeduper(time.Minute),
 		QueueSize: 256,
-		Workers:   4,
+		// 单 worker：多 worker 破坏同会话顺序（见 DefaultWorkers 说明）。
+		// 本条测的是「并发入队不丢消息」，与 worker 数无关。
+		Workers: 1,
 	})
 	if err != nil {
 		t.Fatalf("NewDispatcher: %v", err)
@@ -312,6 +314,31 @@ func TestDispatcher_HandlerErrorDoesNotStopWorkers(t *testing.T) {
 func TestNewDispatcher_RequiresHandler(t *testing.T) {
 	if _, err := NewDispatcher(DispatcherConfig{}); err == nil {
 		t.Error("NewDispatcher must reject a nil Handler")
+	}
+}
+
+func TestNewDispatcher_RejectsMultipleWorkers(t *testing.T) {
+	// 多 worker 破坏同会话消息顺序：N 个 worker 并发取消息，谁先抢到
+	// 串行化域不确定。串行化器是 FIFO 的，但只保证「已到达的调用者」
+	// 之间的顺序——两个 worker 谁先调用它取决于调度。
+	//
+	// 必须**显式拒绝**而非静默降到 1：静默降级会让调用方以为并发已生效。
+	//
+	// 实测依据：workers=4 时 TestE2E_SequentialMessagesInSameSession
+	// 10 次跑出 4 次失败（execution order = [第二句 第一句]）。
+	if _, err := NewDispatcher(DispatcherConfig{
+		Handler: &countingHandler{},
+		Workers: 4,
+	}); err == nil {
+		t.Error("NewDispatcher must reject Workers > 1 (breaks per-session ordering)")
+	}
+	// 边界：1 与 0（默认）都合法
+	for _, w := range []int{0, 1} {
+		d, err := NewDispatcher(DispatcherConfig{Handler: &countingHandler{}, Workers: w})
+		if err != nil {
+			t.Errorf("Workers=%d must be accepted, got %v", w, err)
+		}
+		d.Stop()
 	}
 }
 

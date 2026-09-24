@@ -215,15 +215,11 @@ func runServe(args []string) int {
 	}
 
 	// 凭据来自受信配置（已过滤保留键），不落配置文件。
-	verifyCfg := feishu.VerifyConfigFromEnv(loaded)
-	if verifyCfg.VerificationToken == "" {
-		// fail-closed：不配置就不启动，而不是启动一个拒绝一切请求的端点
-		// 让运维以为服务已就绪。这里把「配置缺失」和「端点拒绝」分开表达。
-		fmt.Fprintf(os.Stderr,
-			"taiji serve: %s 未配置——webhook 端点将拒绝所有回调（fail-closed）。\n"+
-				"  设置方式：在启动环境中导出该变量（凭据不写配置文件，见设计文档 §4.6）。\n",
-			feishu.EnvVerificationToken)
-	}
+	//
+	// 注意：webhook 专属的验签凭据检查**不在这里**——它在 webhook 分支内。
+	// 长连接模式不验签（信任来自 SDK 与飞书的 TLS 通道，§2.2），
+	// 在此处检查会打印一条误导性警告（「webhook 端点将拒绝所有回调」），
+	// 而长连接模式下根本没有 webhook 端点。
 
 	// ── 端到端管道装配（issue #9）──
 	// 把各层串起来：门禁 → 路由 → 串行化 → 执行 → 出站。
@@ -254,6 +250,17 @@ func runServe(args []string) int {
 	if *mode != "webhook" {
 		fmt.Fprintf(os.Stderr, "taiji serve: 未知 --feishu-mode=%q（支持 webhook | longconn）\n", *mode)
 		return 2
+	}
+
+	// webhook 专属：验签凭据检查（长连接不需要，见上方注释）。
+	verifyCfg := feishu.VerifyConfigFromEnv(loaded)
+	if verifyCfg.VerificationToken == "" {
+		// fail-closed：不配置就不启动，而不是启动一个拒绝一切请求的端点
+		// 让运维以为服务已就绪。这里把「配置缺失」和「端点拒绝」分开表达。
+		fmt.Fprintf(os.Stderr,
+			"taiji serve: %s 未配置——webhook 端点将拒绝所有回调（fail-closed）。\n"+
+				"  设置方式：在启动环境中导出该变量（凭据不写配置文件，见设计文档 §4.6）。\n",
+			feishu.EnvVerificationToken)
 	}
 
 	h := feishu.NewHandler(feishu.HandlerConfig{
