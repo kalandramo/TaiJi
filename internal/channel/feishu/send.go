@@ -130,6 +130,36 @@ func (s *Sender) create(ctx context.Context, to string, idType channel.ReceiveID
 	return *resp.Data.MessageId, nil
 }
 
+// sendInteractive 新建一条 interactive（卡片）消息（issue #10）。
+//
+// 与 create 的唯一差异是 msg_type=interactive。抽成独立方法而非给 create
+// 加参数：卡片消息没有"更新"语义（更新走 CardKit 的 Content，不在此），
+// 故不复用 create 的 msgType 参数化路径。
+func (s *Sender) sendInteractive(ctx context.Context, to string, idType channel.ReceiveIDType, content string) (string, error) {
+	body := larkim.NewCreateMessageReqBodyBuilder().
+		ReceiveId(to).
+		MsgType(larkim.MsgTypeInteractive).
+		Content(content).
+		Build()
+
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType(receiveIDTypeValue(idType)).
+		Body(body).
+		Build()
+
+	resp, err := s.client.Im.V1.Message.Create(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("feishu: create interactive message: %w", err)
+	}
+	if !resp.Success() {
+		return "", fmt.Errorf("feishu: create interactive message rejected: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	if resp.Data == nil || resp.Data.MessageId == nil {
+		return "", fmt.Errorf("feishu: create interactive message returned no message_id")
+	}
+	return *resp.Data.MessageId, nil
+}
+
 // update 更新已有消息内容。
 func (s *Sender) update(ctx context.Context, messageID, content string) (string, error) {
 	body := larkim.NewUpdateMessageReqBodyBuilder().

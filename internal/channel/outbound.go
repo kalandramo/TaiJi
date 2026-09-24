@@ -28,6 +28,21 @@ const (
 	ReceiveIDOpen ReceiveIDType = "open_id"
 )
 
+// MessageKind 是出站消息的形态（issue #10）。
+//
+// 引入理由：卡片与文本的 content 结构不同（卡片是 {"type":"card","data":...}，
+// 文本是 {"text":"..."}），而 msg_type 也不同（interactive vs text）。
+// 形态是**渠道无关概念**（其他渠道也可能有富文本形态），故定义在契约层。
+type MessageKind string
+
+const (
+	// KindText 是纯文本消息（既有行为）。
+	// 注意：飞书纯文本**不渲染 Markdown**——列表、代码块、粗体都退化为裸字符。
+	KindText MessageKind = "text"
+	// KindCard 是交互式卡片（Markdown 渲染 + 可流式更新）。
+	KindCard MessageKind = "card"
+)
+
 // SendOptions 控制一次出站。
 type SendOptions struct {
 	// ReceiveIDType 指定 To 的命名空间。空则默认为 ReceiveIDChat。
@@ -39,7 +54,28 @@ type SendOptions struct {
 	// 对齐设计文档 §4.4.1：原型刻意省掉 happyclaw 的 StreamSender/CardKit
 	// 状态机，用「占位消息 → 更新消息」替代。代价是看不到逐 token 打字效果，
 	// 收益是省掉整个卡片状态机。
+	//
+	// 注：issue #10 已补上 CardKit 流式路径（Kind=KindCard 时走该路径）。
 	MessageID string
+
+	// Kind 指定消息形态。空 = KindText（向后兼容，既有调用无需改动）。
+	//
+	// 未知值经 EffectiveKind 回退为 KindText——fail-safe：宁可不渲染卡片，
+	// 也不发一条平台不认的消息。
+	Kind MessageKind
+}
+
+// EffectiveKind 返回生效的消息形态。
+//
+// 空值与未知值都回退 KindText：前者保证向后兼容，后者保证 fail-safe。
+// 把这条规则集中在一处，避免各实现各自判断而漂移。
+func (o SendOptions) EffectiveKind() MessageKind {
+	switch o.Kind {
+	case KindCard:
+		return KindCard
+	default:
+		return KindText
+	}
 }
 
 // Sender 是出站能力面。渠道实现（feishu.Sender）负责协议细节。
