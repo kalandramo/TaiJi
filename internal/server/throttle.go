@@ -35,9 +35,9 @@ const (
 type chunkThrottle struct {
 	mu       sync.Mutex
 	buf      strings.Builder // 累积的完整文本
-	lastSent string        // 上次推送的文本（用于算增量）
-	lastAt   time.Time     // 上次推送时间
-	force    bool          // 下次 ShouldFlush 必返回 true
+	lastSent string          // 上次推送的文本（用于算增量）
+	lastAt   time.Time       // 上次推送时间
+	force    bool            // 下次 ShouldFlush 必返回 true
 }
 
 // newChunkThrottle 构造节流器。now 可注入（测试用）。

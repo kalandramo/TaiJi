@@ -78,7 +78,7 @@ func (p *PrincipalPolicyPlugin) beforeTool() tool.BeforeToolCallbackStructured {
 		}
 		if !allowed {
 			p.log("denied: not permitted (principal=%s tool=%s)", principal.Redacted(), args.ToolName)
-			return denyResult(fmt.Sprintf("你没有使用该工具（%s）的权限。", args.ToolName)), nil
+			return denyResult(denyMessage(args.ToolName)), nil
 		}
 
 		p.log("allowed: principal=%s tool=%s", principal.Redacted(), args.ToolName)
@@ -99,4 +99,24 @@ func (p *PrincipalPolicyPlugin) log(format string, args ...any) {
 // 那条是给开发者看的，这条是给用户看的。
 func denyResult(msg string) *tool.BeforeToolResult {
 	return &tool.BeforeToolResult{CustomResult: msg}
+}
+
+// denyMessage 生成权限拒绝的用户可见文案。
+//
+// **为什么要有「不要重试」这句**（实测缺陷）：首版文案只说「你没有权限」，
+// 模型读到后连试 3 次同一个工具——用户日志里出现 3 条
+// `[perm] denied: not permitted`，最终回复也是三次失败后的道歉。
+//
+// 根因：模型把 CustomResult 当普通工具返回值，认为「换个说法再试一次」
+// 可能成功。但这是**确定性拒绝**——权限表不会因为重试而改变。
+// 明确告知「不要重试」能让模型立即转向回答用户（如「请让管理员授权」）。
+//
+// 代价（明示）：这句话对模型是行为指令，无法在协议层强制。若模型
+// 仍重试，还有一层兜底——见 chat 层的工具调用轮次上限（当前未设，
+// 属已知缺口）。
+func denyMessage(toolName string) string {
+	return fmt.Sprintf(
+		"你没有使用该工具（%s）的权限。这是确定性拒绝，**重试不会成功**，"+
+			"请不要再次调用该工具，改为向用户说明需要管理员授权。",
+		toolName)
 }

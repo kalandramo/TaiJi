@@ -47,8 +47,17 @@ type StreamingSender interface {
 
 	// StartCardStream 创建卡片会话并发送卡片消息。
 	//
+	// placeholder 是卡片的**初始内容**，在创建卡片时就写入。
+	//
+	// 为什么必须传（实测缺陷）：首版传空串创建卡片，用户看到的是一个
+	// **空白框**——从卡片消息发出到首个 chunk 到达（可能数秒，模型要
+	// 先思考）之间，卡片没有任何内容。用户以为坏了。
+	//
+	// 不能在 StartCardStream 返回后再用 Update 补：那时卡片消息已经发出，
+	// 用户仍会看到空窗。必须在**创建时**就有内容。
+	//
 	// 返回的 CardStream 供后续 Update/Close。若创建或发送失败，
 	// 返回 error——调用方据此降级（**降级是调用方的职责**，
 	// 契约层不替它决定，因为降级策略属编排）。
-	StartCardStream(ctx context.Context, to string, opts SendOptions) (CardStream, error)
+	StartCardStream(ctx context.Context, to, placeholder string, opts SendOptions) (CardStream, error)
 }

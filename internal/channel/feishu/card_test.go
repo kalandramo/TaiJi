@@ -286,7 +286,7 @@ func TestCard_ImplementsStreamingSender(t *testing.T) {
 		t.Fatal("feishu.Sender 应满足 channel.StreamingSender")
 	}
 
-	stream, err := ss.StartCardStream(context.Background(), "ou_user",
+	stream, err := ss.StartCardStream(context.Background(), "ou_user", "思考中…",
 		channel.SendOptions{ReceiveIDType: channel.ReceiveIDOpen})
 	if err != nil {
 		t.Fatalf("StartCardStream: %v", err)
@@ -301,7 +301,7 @@ func TestCard_StartCardStreamSequence(t *testing.T) {
 	f := &fakeCardkit{}
 	s, _ := newCardSender(t, f)
 
-	stream, err := s.StartCardStream(context.Background(), "ou_user",
+	stream, err := s.StartCardStream(context.Background(), "ou_user", "思考中…",
 		channel.SendOptions{ReceiveIDType: channel.ReceiveIDOpen})
 	if err != nil {
 		t.Fatalf("StartCardStream: %v", err)
@@ -342,7 +342,7 @@ func TestCard_CloseWritesFinalThenClosesStreaming(t *testing.T) {
 	f := &fakeCardkit{}
 	s, _ := newCardSender(t, f)
 
-	stream, err := s.StartCardStream(context.Background(), "ou_user",
+	stream, err := s.StartCardStream(context.Background(), "ou_user", "思考中…",
 		channel.SendOptions{ReceiveIDType: channel.ReceiveIDOpen})
 	if err != nil {
 		t.Fatalf("StartCardStream: %v", err)

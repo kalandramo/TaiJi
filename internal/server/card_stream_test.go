@@ -19,12 +19,13 @@ import (
 
 // fakeStreamingSender 记录卡片流式调用。
 type fakeStreamingSender struct {
-	mu        sync.Mutex
-	updates   []string
-	closed    bool
-	closeText string
-	startErr  error
-	updateErr error
+	mu          sync.Mutex
+	updates     []string
+	closed      bool
+	closeText   string
+	startErr    error
+	updateErr   error
+	placeholder string // 创建卡片时传入的占位文本
 
 	// 文本路径的记录（降级时用）
 	textCalls []string
@@ -40,7 +41,10 @@ func (f *fakeStreamingSender) SendMessage(ctx context.Context, to, text string, 
 	return "om_placeholder", nil
 }
 
-func (f *fakeStreamingSender) StartCardStream(ctx context.Context, to string, opts channel.SendOptions) (channel.CardStream, error) {
+func (f *fakeStreamingSender) StartCardStream(ctx context.Context, to, placeholder string, opts channel.SendOptions) (channel.CardStream, error) {
+	f.mu.Lock()
+	f.placeholder = placeholder
+	f.mu.Unlock()
 	if f.startErr != nil {
 		return nil, f.startErr
 	}

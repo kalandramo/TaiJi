@@ -84,6 +84,25 @@ type Config struct {
 // DefaultPlaceholder 是占位消息的默认文本。
 const DefaultPlaceholder = "思考中…"
 
+// unsupportedKindReply 生成「消息类型不支持」的用户提示。
+//
+// 每种类型给具体说法：用户看到「暂不支持图片消息」比「输入为空」清楚得多，
+// 且知道该怎么改（改发文字）。未知类型走兜底文案，仍带上平台类型名
+// 便于排障时对照。
+func unsupportedKindReply(kind string) string {
+	label := map[string]string{
+		"image":   "图片",
+		"file":    "文件",
+		"audio":   "语音",
+		"media":   "视频",
+		"sticker": "表情包",
+	}[kind]
+	if label == "" {
+		label = kind
+	}
+	return fmt.Sprintf("抱歉，我暂时无法识别%s消息。请改用文字描述你的需求。", label)
+}
+
 // Pipeline 是端到端管道。
 type Pipeline struct {
 	sender      channel.Sender
@@ -170,6 +189,28 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 	// 无法可靠判定个人角色，故渠道来源的写操作一律拒绝。
 	runCtx := authz.WithContextKind(ctx, authz.KindChannel)
 
+	// 非文本消息（图片/文件/语音…）：正文为空，且这不是「用户没输入」，
+	// 而是「我们不支持这种输入」。给出针对性提示后返回。
+	//
+	// 为什么在这里而不是让执行层报 ErrBlankInput：那条路径会让用户看到
+	// 「chat: input is blank」——内部错误串泄漏到用户界面，且把「能力缺失」
+	// 说成「你的输入有问题」。用户发了图片，提示应该说「暂不支持图片」。
+	//
+	// 位置选在门禁与路由之后、串行化之前：不占会话串行域（无需排队），
+	// 也保证日志里有 jid 可追溯。
+	if msg.UnsupportedKind != "" {
+		p.logf("server: unsupported message kind=%s message_id=%s（正文为空，不调用模型）",
+			msg.UnsupportedKind, msg.MessageID)
+		receiver, idType := receiverOf(msg)
+		if _, err := p.sender.SendMessage(runCtx, receiver,
+			unsupportedKindReply(msg.UnsupportedKind), channel.SendOptions{
+				ReceiveIDType: idType,
+			}); err != nil {
+			return fmt.Errorf("server: reply unsupported kind: %w", err)
+		}
+		return nil
+	}
+
 	// 身份注入：把发送者身份放进 runCtx，供下游按用户判定。
 	//
 	// 为什么在这里：msg.UserID 来自平台元数据（飞书 sender.open_id，
@@ -218,21 +259,42 @@ func (p *Pipeline) deliverAnswer(
 ) error {
 	// 尝试卡片流式路径。
 	if ss, ok := p.sender.(channel.StreamingSender); ok {
-		if err := p.streamViaCard(runCtx, ss, sessionID, msg, receiver, idType); err == nil {
+		err := p.streamViaCard(runCtx, ss, sessionID, msg, receiver, idType)
+		if err == nil {
 			return nil // 卡片路径成功
-		} else {
-			// 降级：记日志后走文本路径。**不返回错误**——卡片失败不该
-			// 让用户收不到回答（它是展示层增强）。
-			p.logf("server: card streaming failed, falling back to text message_id=%s err=%v",
-				msg.MessageID, err)
 		}
+		// 降级决策取决于**卡片是否已经发出**（实测缺陷）。
+		//
+		// 若卡片已发出（用户已看到），再走文本路径会让用户收到**两条**
+		// 消息：一条卡片（可能是错误内容）+ 一条文本。用户实测见过
+		// 「抱歉，处理时出错：chat: input is blank」出现两次。
+		//
+		// 分界点用 errors.Is(err, errCardStarted)：StartCardStream 之前
+		// 失败 → 用户什么都还没看到 → 可以安全降级；之后失败 → 卡片
+		// 已在会话里 → 只能把错误写进卡片，不能另发一条。
+		if errors.Is(err, errCardStarted) {
+			p.logf("server: card failed after it was sent, not falling back "+
+				"（避免重复消息）message_id=%s err=%v", msg.MessageID, err)
+			return nil // 卡片已收尾（streamViaCard 内部保证 Close），不再发文本
+		}
+		p.logf("server: card streaming failed, falling back to text message_id=%s err=%v",
+			msg.MessageID, err)
 	}
 	return p.deliverAsText(runCtx, sessionID, msg, receiver, idType)
 }
 
+// errCardStarted 标记「卡片消息已发出后」发生的失败。
+//
+// 用途：让 deliverAnswer 区分「降级安全」与「降级会产生重复消息」。
+// 判定分界在 StartCardStream 成功返回的那一刻——此前用户什么都没看到，
+// 此后卡片已在会话里可见。
+var errCardStarted = errors.New("card already sent")
+
 // streamViaCard 用卡片流式投递（issue #10）。
 //
-// 返回 error 表示卡片路径不可用（调用方据此降级）；返回 nil 表示成功。
+// 返回 error 表示卡片路径不可用；返回 nil 表示成功。
+// 若错误发生在卡片已发出**之后**，返回的错误包装了 errCardStarted，
+// 调用方据此决定不降级（见 deliverAnswer）。
 func (p *Pipeline) streamViaCard(
 	runCtx context.Context,
 	ss channel.StreamingSender,
@@ -241,12 +303,17 @@ func (p *Pipeline) streamViaCard(
 	receiver string,
 	idType channel.ReceiveIDType,
 ) error {
-	stream, err := ss.StartCardStream(runCtx, receiver, channel.SendOptions{
+	// 占位文本在**创建卡片时**写入——否则从卡片发出到首个 chunk
+	// 之间用户看到空白框（实测缺陷）。
+	stream, err := ss.StartCardStream(runCtx, receiver, p.placeholder, channel.SendOptions{
 		ReceiveIDType: idType,
 	})
 	if err != nil {
+		// 卡片还没发出，降级安全。
 		return fmt.Errorf("start card stream: %w", err)
 	}
+
+	// ── 分界线：此后卡片已在会话里可见，失败不能再降级 ──
 
 	// 节流器：避免每个 token 都触发网络请求（见 throttle.go）。
 	th := newChunkThrottle()
@@ -275,11 +342,16 @@ func (p *Pipeline) streamViaCard(
 		final = th.Text() // 执行失败但已有部分内容时，保留已生成的
 	}
 	if err := stream.Close(runCtx, final); err != nil {
-		return fmt.Errorf("close card stream: %w", err)
+		// 卡片已发出，Close 也失败——用户会看到卡住的卡片。
+		// 返回带 errCardStarted 的错误：调用方**不该**再发一条文本
+		// （那会变成两条消息），但需要记日志。
+		return fmt.Errorf("%w: close card stream: %w", errCardStarted, err)
 	}
 
 	if execErr != nil {
-		return fmt.Errorf("execute: %w", execErr)
+		// 错误已写进卡片（final 是错误提示），用户看得到。
+		// 仍返回 errCardStarted：不降级（避免重复消息）。
+		return fmt.Errorf("%w: execute: %w", errCardStarted, execErr)
 	}
 	return nil
 }

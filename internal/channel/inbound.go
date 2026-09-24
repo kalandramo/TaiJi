@@ -58,6 +58,22 @@ type IncomingMessage struct {
 	Content   string
 	Mentions  []Mention
 	Meta      *ChannelMessageMeta
+
+	// UnsupportedKind 非空表示「消息类型本身不被支持」，值是平台原生的
+	// 消息类型（飞书为 image / file / audio / media / post / sticker 等）。
+	//
+	// 为什么需要这个字段（实测缺陷）：非文本消息的 content 里没有 text 字段
+	// （图片是 `{"image_key":"..."}`，文件是 `{"file_key":"..."}`），解析后
+	// Content 为空串。下游拿到空串只能报「输入为空」——而用户明明发了东西，
+	// 这个提示既没解释原因也没给出路。
+	//
+	// 有它之后下游能给出针对性回复（「暂不支持图片消息」），
+	// 而不是把「能力缺失」伪装成「用户输入错误」。
+	//
+	// 判定规则：Content 为空 **且** 平台声明了非空 message_type **且**
+	// 该类型不是纯文本类。三者同时满足才标记——文本消息的空正文
+	// （用户只发了空白）不该被误报为「类型不支持」。
+	UnsupportedKind string
 }
 
 // ChannelMessageMeta 是平台原生上下文元数据。

@@ -203,7 +203,7 @@ func incomingFromLongConnEvent(ev *larkim.P2MessageReceiveV1) *channel.IncomingM
 		return nil
 	}
 
-	var chatID, chatType, messageID, content, threadID, rootID string
+	var chatID, chatType, messageID, content, threadID, rootID, messageType string
 	if m.ChatId != nil {
 		chatID = *m.ChatId
 	}
@@ -221,6 +221,11 @@ func incomingFromLongConnEvent(ev *larkim.P2MessageReceiveV1) *channel.IncomingM
 	}
 	if m.RootId != nil {
 		rootID = *m.RootId
+	}
+	// 消息类型（image/file/audio/...）：正文为空时用它区分
+	// 「类型不支持」与「输入为空」——见 unsupportedKind。
+	if m.MessageType != nil {
+		messageType = *m.MessageType
 	}
 
 	text := extractText(content)
@@ -243,6 +248,7 @@ func incomingFromLongConnEvent(ev *larkim.P2MessageReceiveV1) *channel.IncomingM
 			MessageID:         messageID,
 			Text:              text,
 		},
+		UnsupportedKind: unsupportedKind(messageType, text),
 	}
 }
 

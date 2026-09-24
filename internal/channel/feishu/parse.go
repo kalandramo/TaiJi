@@ -145,6 +145,9 @@ func extractMentions(in []eventMention) []channel.Mention {
 // **代价（明示）**：富文本（post）的正文在 content 数组里，text 字段不存在，
 // 因此其 Content 为空。若后续需要富文本，应在此函数补 post 分支——
 // 它不影响其他字段的正确性。
+//
+// 非文本消息的「类型不支持」由 unsupportedKind 单独判定并标记到
+// IncomingMessage.UnsupportedKind（见该函数）——本函数只负责取文本。
 func extractText(content string) string {
 	var payload struct {
 		Text string `json:"text"`
@@ -153,4 +156,41 @@ func extractText(content string) string {
 		return ""
 	}
 	return payload.Text
+}
+
+// textMessageTypes 是「正文能由 extractText 取出」的消息类型。
+//
+// 依据飞书消息类型清单（open.feishu.cn 的 message_content 文档）：
+// text 是纯文本；post 是富文本（正文在 content 数组，本原型不解析）。
+// 其余类型（image/file/audio/media/sticker 等）的 content 里没有 text 字段。
+//
+// 为何把 post 也列为「文本类」：它是**用户能输入正文**的消息类型，
+// 报「不支持图片」会误导。它的 Content 为空是解析能力不足，
+// 属于另一类问题（见 extractText 的代价说明）。
+var textMessageTypes = map[string]bool{
+	"text": true,
+	"post": true,
+}
+
+// unsupportedKind 判定「消息类型本身不被支持」，返回平台原生类型名。
+//
+// 触发条件（三者同时满足，见 channel.IncomingMessage.UnsupportedKind 的注释）：
+//   - 正文为空（extractText 没取到 text）
+//   - 平台声明了非空 message_type
+//   - 该类型不在 textMessageTypes 里
+//
+// 为何要求「正文为空」：用户发文本消息但正文是空白时，message_type=text，
+// 不会被标记（text 在 textMessageTypes 里）。若用户发了 image 但（不可能地）
+// content 里带 text 字段，也不标记——有正文就优先按正文处理。
+//
+// 为何要求「类型非空」：类型缺失时不标记。缺字段是信封残缺，
+// 把它报成「类型不支持」会把解析问题伪装成能力问题。
+func unsupportedKind(messageType, text string) string {
+	if text != "" || messageType == "" {
+		return ""
+	}
+	if textMessageTypes[messageType] {
+		return ""
+	}
+	return messageType
 }

@@ -27,8 +27,8 @@ func groupMsg(text, senderID string, mentions []channel.Mention) *channel.Incomi
 		Content:   text,
 		Mentions:  mentions,
 		Meta: &channel.ChannelMessageMeta{
-			Provider: string(channel.PlatformFeishu),
-			ChatType: "group",
+			Provider:  string(channel.PlatformFeishu),
+			ChatType:  "group",
 			MessageID: "om_1",
 			Text:      text,
 		},
@@ -45,8 +45,8 @@ func directMsg(text, senderID string) *channel.IncomingMessage {
 		MessageID: "om_dm",
 		Content:   text,
 		Meta: &channel.ChannelMessageMeta{
-			Provider: string(channel.PlatformFeishu),
-			ChatType: "p2p",
+			Provider:  string(channel.PlatformFeishu),
+			ChatType:  "p2p",
 			MessageID: "om_dm",
 			Text:      text,
 		},

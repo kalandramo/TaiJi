@@ -17,11 +17,12 @@ import (
 
 // 编译期断言：fakeStreamingSender 满足 StreamingSender。
 type fakeStreamingSender struct {
-	created   int
-	streamed  []string
-	closed    bool
-	sendErr   error
-	createErr error
+	created     int
+	placeholder string // 记录创建卡片时传入的占位文本
+	streamed    []string
+	closed      bool
+	sendErr     error
+	createErr   error
 }
 
 func (f *fakeStreamingSender) SendMessage(ctx context.Context, to, text string, opts SendOptions) (string, error) {
@@ -31,11 +32,12 @@ func (f *fakeStreamingSender) SendMessage(ctx context.Context, to, text string, 
 	return "om_1", nil
 }
 
-func (f *fakeStreamingSender) StartCardStream(ctx context.Context, to string, opts SendOptions) (CardStream, error) {
+func (f *fakeStreamingSender) StartCardStream(ctx context.Context, to, placeholder string, opts SendOptions) (CardStream, error) {
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
 	f.created++
+	f.placeholder = placeholder
 	return &fakeCardStream{parent: f}, nil
 }
 
@@ -59,7 +61,7 @@ var _ StreamingSender = (*fakeStreamingSender)(nil)
 func TestStreamingSender_InterfaceShape(t *testing.T) {
 	// 契约：StartCardStream 返回可 Update/Close 的流。
 	var s StreamingSender = &fakeStreamingSender{}
-	stream, err := s.StartCardStream(context.Background(), "ou_user", SendOptions{})
+	stream, err := s.StartCardStream(context.Background(), "ou_user", "思考中…", SendOptions{})
 	if err != nil {
 		t.Fatalf("StartCardStream: %v", err)
 	}

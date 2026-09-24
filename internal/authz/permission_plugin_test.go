@@ -82,6 +82,44 @@ func TestPrincipalPolicy_NilSourceDeniesAll(t *testing.T) {
 	}
 }
 
+// 拒绝文案必须含「不要重试」指令（实测缺陷修复）。
+//
+// 用户实测（2026-09-24 22:59）：模型被拒后**连试 3 次**同一个工具，
+// 日志出现 3 条 [perm] denied，最终回复是三次失败后的道歉。
+//
+// 根因：模型把 CustomResult 当普通工具返回值，认为换个说法重试可能成功。
+// 但权限判定是确定性的——重试不会改变结果。文案必须明说这点。
+//
+// 这条测试锁定文案的**语义要素**，不是逐字比对：
+// 只要含「不要/请勿重试」这类指令就算通过，允许后续润色措辞。
+func TestPrincipalPolicy_DenyMessageTellsModelNotToRetry(t *testing.T) {
+	plugin := NewPrincipalPolicyPlugin(NewStaticPermissions(map[string][]string{
+		"ws1:feishu:ou_alice": {"mockmcp_echo"},
+	}), nil)
+
+	ctx := WithPrincipal(context.Background(), Principal{ID: "ws1:feishu:ou_bob"})
+	got := runBeforeTool(t, plugin, ctx, "mockmcp_echo")
+
+	if got == nil || got.CustomResult == nil {
+		t.Fatal("应被拒")
+	}
+	msg, _ := got.CustomResult.(string)
+
+	// 必须明确告知「重试无用」——否则模型会反复调用同一工具
+	if !strings.Contains(msg, "重试") {
+		t.Errorf("拒绝文案应明确告知重试无效（模型会连试多次），got %q", msg)
+	}
+	// 必须指出这是确定性拒绝（不是暂时性故障）
+	if !strings.Contains(msg, "确定") {
+		t.Errorf("拒绝文案应说明是确定性拒绝（区别于临时故障），got %q", msg)
+	}
+	// 应给出路（向用户说明需授权），而不是让模型卡在重试循环
+	if !strings.Contains(msg, "管理员") && !strings.Contains(msg, "授权") {
+		t.Errorf("拒绝文案应给出路（如请管理员授权），got %q", msg)
+	}
+	t.Logf("✓ 拒绝文案含停止指令: %q", msg)
+}
+
 // 权限源返回 error → 拒绝，且日志区分"查不了"与"不允许"。
 func TestPrincipalPolicy_SourceErrorDeniedAndLogged(t *testing.T) {
 	var logged []string

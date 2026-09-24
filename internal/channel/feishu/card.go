@@ -252,10 +252,13 @@ func (a *cardStreamAdapter) Close(ctx context.Context, finalText string) error {
 
 // StartCardStream 实现 channel.StreamingSender。
 //
-// 两步：创建卡片实体 → 发送卡片消息。任一步失败都返回 error，
-// 调用方据此降级到纯文本（见设计文档 §4.4）。
-func (s *Sender) StartCardStream(ctx context.Context, to string, opts channel.SendOptions) (channel.CardStream, error) {
-	stream, err := s.CreateCardStream(ctx, "")
+// 三步：创建卡片实体（含占位内容）→ 发送卡片消息 → 开启 streaming。
+// 任一步失败都返回 error，调用方据此降级到纯文本（见设计文档 §4.4）。
+//
+// placeholder 在**创建卡片时**写入（不是发消息后补）——否则从卡片发出
+// 到首个 chunk 之间用户看到空白框。实测缺陷，见契约层注释。
+func (s *Sender) StartCardStream(ctx context.Context, to, placeholder string, opts channel.SendOptions) (channel.CardStream, error) {
+	stream, err := s.CreateCardStream(ctx, placeholder)
 	if err != nil {
 		return nil, err
 	}
