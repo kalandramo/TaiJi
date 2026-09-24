@@ -492,19 +492,6 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 			"工具策略默认拒绝，所有工具调用都会被拒。请显式列出要放行的工具名"+
 			"（如 mockmcp_echo）。", len(toolSets))
 	}
-	// 装配成功时也打印——否则启动输出里只有 SDK 的底层日志，
-	// 用户无法确认「MCP 到底挂上没」「白名单到底生效没」。
-	// CLI 路径一直有这两行，serve 路径曾缺（可观测性缺口）。
-	for _, c := range mcpCfgs {
-		logf("MCP server %q 已就绪（%s）", c.Name, c.Transport)
-	}
-	if len(toolSets) > 0 {
-		if len(allowTools) > 0 {
-			logf("工具策略：默认拒绝，放行 %v", allowTools)
-		} else {
-			logf("工具策略：默认拒绝，白名单为空——%d 个已注册工具均不可执行", len(toolSets))
-		}
-	}
 	// 远程 server 无认证头时提示：多数托管 MCP 服务要求 token，
 	// 缺失会以 401 形式在**调用时**才暴露，启动期提示更易定位。
 	for _, c := range mcpCfgs {
@@ -514,6 +501,7 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 				c.Name, c.Transport, mcpHeadersPrefix, c.Name)
 		}
 	}
+
 	executor, err := chat.NewExecutor(chat.Options{
 		Config:     modelCfg,
 		AppName:    "taiji",
@@ -524,7 +512,31 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	})
 	if err != nil {
 		bootstrap.CloseMCPSets(toolSets)
+		// 白名单校验失败是最常见的启动失败（工具名带 {server}_ 前缀，
+		// 少写或写错大小写都会命中）。此时把「实际可用的工具名」打出来，
+		// 用户不必从 error 文本里反推。
+		if names := registeredToolNamesHint(mcpCfgs); len(names) > 0 {
+			logf("提示：本次装配的 MCP server 为 %v。"+
+				"工具名形如 {server名}_{远端工具名}，大小写敏感——"+
+				"请以错误信息里 registered: 后面的名字为准。", serverNames(mcpCfgs))
+		}
 		return nil, fmt.Errorf("装配执行器: %w", err)
+	}
+
+	// 装配成功后才打印生效状态——放在 NewExecutor **之后**，
+	// 否则白名单校验失败时会先打印「放行 [...]」再报错，误导为成功。
+	logf("MCP server 已装配：%v", serverNames(mcpCfgs))
+	if len(toolSets) > 0 {
+		registered := executor.RegisteredTools()
+		if len(registered) > 0 {
+			logf("模型可见的工具名：%v", registered)
+		}
+		if allowed := executor.AllowedTools(); len(allowed) > 0 {
+			logf("工具策略：默认拒绝，放行 %v", allowed)
+		} else {
+			logf("工具策略：默认拒绝，白名单为空——%d 个已注册工具均不可执行",
+				len(registered))
+		}
 	}
 
 	p, err := server.New(server.Config{
@@ -685,4 +697,26 @@ func runLongConn(loaded map[string]string, pipeline *pipelineHolder, dispatcher 
 	dispatcher.Stop()
 	fmt.Fprintln(os.Stderr, "taiji serve: 已关闭")
 	return 0
+}
+
+// serverNames 提取 MCP server 名（用于日志）。
+func serverNames(cfgs []bootstrap.MCPServerConfig) []string {
+	out := make([]string, 0, len(cfgs))
+	for _, c := range cfgs {
+		out = append(out, c.Name)
+	}
+	return out
+}
+
+// registeredToolNamesHint 在装配失败时给出可诊断的线索。
+//
+// 白名单校验失败（工具名未注册）是最常见的启动失败——工具名是
+// {server名}_{远端工具名} 拼出来的，且**大小写敏感**。
+// 这里只需确认「本次确实配了 server」，具体名字由 authz 的错误信息列出
+// （validateAllowList 会打印 registered: ... 列表）。
+func registeredToolNamesHint(cfgs []bootstrap.MCPServerConfig) []string {
+	if len(cfgs) == 0 {
+		return nil
+	}
+	return serverNames(cfgs)
 }

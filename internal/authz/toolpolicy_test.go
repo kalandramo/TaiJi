@@ -137,3 +137,85 @@ func TestToolNames_ExtractsDeclarations(t *testing.T) {
 		t.Errorf("toolNames = %v, want [a b]", got)
 	}
 }
+
+// 白名单名字写错时的诊断质量（真实场景驱动）。
+//
+// 场景：用户配了远程 SSE MCP，server 名 "Infraverse"，白名单写了
+// "infraverse_dce_ip"，但模型可见名是 "Infraverse_infraverse_dce_ip"
+// （{server名}_{远端工具名} 拼成，大小写敏感）。
+//
+// 若错误只报「未注册」而不列已注册名，用户只能靠猜。
+// validateAllowList 的设计目标就是让这种排错不必翻代码。
+func TestValidateAllowList_ListsRegisteredNames(t *testing.T) {
+	registered := []tool.Tool{
+		fakeTool{"Infraverse_infraverse_dce_ip"},
+		fakeTool{"mockmcp_echo"},
+	}
+
+	_, err := BuildToolPolicy(ToolPolicyConfig{
+		Allow:      []string{"infraverse_dce_ip"},
+		Registered: registered,
+	})
+	if err == nil {
+		t.Fatal("未注册的名字应报错")
+	}
+
+	msg := err.Error()
+	// 必须指出写错的名字
+	if !strings.Contains(msg, "infraverse_dce_ip") {
+		t.Errorf("错误信息应指出写错的名字，实际 = %q", msg)
+	}
+	// 必须列出已注册的名字（用户据此改正）
+	if !strings.Contains(msg, "Infraverse_infraverse_dce_ip") {
+		t.Errorf("错误信息应列出已注册名，实际 = %q", msg)
+	}
+}
+
+// 校验是大小写敏感的：Infraverse_xxx ≠ infraverse_xxx。
+//
+// 这条锁住「用户按直觉写全小写会失败」这一真实陷阱——
+// 失败是**正确**行为（名字必须精确匹配），但必须给出可诊断的错误。
+func TestValidateAllowList_CaseSensitive(t *testing.T) {
+	registered := []tool.Tool{fakeTool{"Infraverse_dce_ip"}}
+
+	// 全小写 → 未注册（报错，且列出正确的名字）
+	_, err := BuildToolPolicy(ToolPolicyConfig{
+		Allow:      []string{"infraverse_dce_ip"},
+		Registered: registered,
+	})
+	if err == nil {
+		t.Error("大小写不同的名字应被判为未注册")
+	} else if !strings.Contains(err.Error(), "Infraverse_dce_ip") {
+		t.Errorf("错误应给出正确大小写，实际 = %q", err.Error())
+	}
+
+	// 大小写一致 → 通过
+	if _, err := BuildToolPolicy(ToolPolicyConfig{
+		Allow:      []string{"Infraverse_dce_ip"},
+		Registered: registered,
+	}); err != nil {
+		t.Errorf("大小写一致的名字应通过，got %v", err)
+	}
+}
+
+// 多个名字写错时，全部列出（不静默丢弃任何一个）。
+func TestValidateAllowList_ReportsAllUnknown(t *testing.T) {
+	registered := []tool.Tool{fakeTool{"srv_ok"}}
+
+	_, err := BuildToolPolicy(ToolPolicyConfig{
+		Allow:      []string{"bad_one", "srv_ok", "bad_two"},
+		Registered: registered,
+	})
+	if err == nil {
+		t.Fatal("应报错")
+	}
+	msg := err.Error()
+	for _, want := range []string{"bad_one", "bad_two"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误应含 %q，实际 = %q", want, msg)
+		}
+	}
+	if !strings.Contains(msg, "2 tool(s)") {
+		t.Errorf("应报告 2 个未注册，实际 = %q", msg)
+	}
+}

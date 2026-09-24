@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
@@ -68,6 +69,28 @@ func (e *Executor) Close() {
 	if e != nil {
 		e.asm.Close()
 	}
+}
+
+// RegisteredTools 返回模型可见的工具名（排序后）。
+//
+// 用途：调用方在启动期打印「实际有哪些工具可放行」，避免配错名字后
+// 只能从报错里反推。装配失败时拿不到（NewExecutor 返回 error），
+// 故调用方需在装配**成功后**调用。
+func (e *Executor) RegisteredTools() []string {
+	if e == nil || e.asm == nil || e.asm.agent == nil {
+		return nil
+	}
+	names := authz.ToolNames(e.asm.agent.Tools())
+	sort.Strings(names)
+	return names
+}
+
+// AllowedTools 返回生效的白名单（排序后）。
+func (e *Executor) AllowedTools() []string {
+	if e == nil || e.asm == nil || e.asm.policy == nil {
+		return nil
+	}
+	return e.asm.policy.AllowedTools()
 }
 
 // Execute 执行单轮：发消息 → 消费事件流 → 返回完整回答。
