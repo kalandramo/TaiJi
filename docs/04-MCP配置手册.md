@@ -90,7 +90,22 @@ setx TAIJI_ALLOW_TOOLS "mockmcp_echo,github_search_code,github_get_file_contents
 
 例：server 名 `mockmcp` + 裸工具 `echo` → 白名单里要写 `mockmcp_echo`。
 
-**写错名的后果**：`BuildToolPolicy` 会校验白名单条目是否存在于已注册工具中，未注册的名字会**报错并列出**（不静默忽略）——这是 issue #4 的有意设计，避免「配了却没生效」难以排查。
+**⚠ 大小写敏感**。`Infraverse_dce_ip` 与 `infraverse_dce_ip` 是两个不同的名字。若 server 名写成大写开头（如 `Infraverse`），白名单必须逐字匹配——包括远端工具名部分可能自带的 `infraverse_` 前缀，最终形如 `Infraverse_infraverse_dce_ip`。
+
+**写错名的后果**：`BuildToolPolicy` 会校验白名单条目是否存在于已注册工具中，未注册的名字会**报错并列出已注册名**（不静默忽略）——这是 issue #4 的有意设计，避免「配了却没生效」难以排查。实际输出：
+
+```
+taiji serve: 装配执行器: authz: allow list names 1 tool(s) that are not
+             registered: infraverse_dce_ip (registered: Infraverse_infraverse_dce_ip)
+```
+
+`registered:` 后面就是该填进白名单的名字。启动**成功**时也会打印可用工具名：
+
+```
+[pipeline] MCP server 已装配：[mockmcp]
+[pipeline] 模型可见的工具名：[mockmcp_echo]
+[pipeline] 工具策略：默认拒绝，放行 [mockmcp_echo]
+```
 
 ### 2.3 `TAIJI_MCP_HEADERS_<server名>`
 
@@ -202,11 +217,14 @@ var ReservedPrefixes = []string{
 **Serve 路径（含长连接）**：
 
 ```
-[pipeline] MCP server "mockmcp" 已就绪（stdio）
+[pipeline] MCP server 已装配：[mockmcp]
+[pipeline] 模型可见的工具名：[mockmcp_echo]
 [pipeline] 工具策略：默认拒绝，放行 [mockmcp_echo]
 ```
 
-若第二行显示 `白名单为空——N 个已注册工具均不可执行`，说明 `TAIJI_ALLOW_TOOLS` 没生效。
+若最后一行显示 `白名单为空——N 个已注册工具均不可执行`，说明 `TAIJI_ALLOW_TOOLS` 没生效。
+
+**注意**：这三行只在**装配成功**后打印。若白名单名字写错，进程会在装配时失败退出（fail-fast），此时输出的是诊断提示而非这三行——详见 §2.2 的错误示例。
 
 **第 2 步：确认工具可调用**
 
