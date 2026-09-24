@@ -404,12 +404,23 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	}
 
 	// 执行器：长驻，跨消息共享 session（多轮历史的前提）。
+	//
+	// AllowTools 必须传：工具策略是默认拒绝 + 白名单放行（issue #4）。
+	// 漏传时白名单为空 → 所有工具被拒，而模型仍看得见工具名，
+	// 表现为「配了 MCP 却不生效」且无报错（issue #9 AC-2 的根因）。
+	allowTools := envAllowTools()
+	if len(toolSets) > 0 && len(allowTools) == 0 {
+		logf("警告：已装配 %d 个 MCP server，但 TAIJI_ALLOW_TOOLS 为空——"+
+			"工具策略默认拒绝，所有工具调用都会被拒。请显式列出要放行的工具名"+
+			"（如 mockmcp_echo）。", len(toolSets))
+	}
 	executor, err := chat.NewExecutor(chat.Options{
-		Config:   modelCfg,
-		AppName:  "taiji",
-		UserID:   "feishu",
-		ToolSets: toolSets,
-		Echo:     logw,
+		Config:     modelCfg,
+		AppName:    "taiji",
+		UserID:     "feishu",
+		ToolSets:   toolSets,
+		AllowTools: allowTools,
+		Echo:       logw,
 	})
 	if err != nil {
 		bootstrap.CloseMCPSets(toolSets)
@@ -488,6 +499,29 @@ func envMCPSpecs() []string {
 		return nil
 	}
 	parts := strings.Split(v, ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// envAllowTools 从环境读工具白名单（逗号分隔的模型可见工具名）。
+//
+// 为什么 serve 也需要它：工具策略是「默认拒绝 + 白名单放行」（issue #4），
+// 空白名单意味着**全部拒绝**。若 serve 路径没有白名单通道，配了 MCP server
+// 也永远无法执行——模型看得见工具、调用被策略拒，且没有任何报错
+// （issue #9 AC-2 在真实平台无法验证的根因）。
+//
+// 分隔符用逗号，与 TAIJI_FEISHU_OWNERS 一致。
+func envAllowTools() []string {
+	v := strings.TrimSpace(os.Getenv("TAIJI_ALLOW_TOOLS"))
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		if p = strings.TrimSpace(p); p != "" {
