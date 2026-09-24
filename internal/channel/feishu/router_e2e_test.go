@@ -8,48 +8,34 @@ import (
 
 // 端到端路由验收（issue #7）。
 //
-// 与 router_test.go 的区别：那里直接构造 IncomingMessage；
-// 这里用**真实飞书事件 JSON** 走 ParseCallback → ResolveRoute 全链路，
-// 验证解析层与路由层的**接线**——尤其是 nativeContextType 的取值
-// 是否真能驱动分流（解析层只填 ThreadID，ContextID 恒空）。
+// **驱动方式已从 webhook 改为直构 IncomingMessage**：原型只用长连接，
+// webhook 实现（含 ParseCallback）已删除。长连接路径由 SDK 回调直接
+// 产出 IncomingMessage（longconn.go），故这里直接构造——与真实形态一致。
+//
+// 验证内容不变：渠道前缀隔离、话题分流、无 thread 时的保守判定，
+// 以及 nativeContextType 的取值契约（解析层只填 ThreadID，ContextID 恒空）。
 
-// threadGroupEventJSON 构造带 thread_id 的群消息事件。
-// threadID 为空则产出普通群消息（无 thread_id 字段）。
-func threadGroupEventJSON(threadID, rootID, text string) string {
-	threadPart := ""
-	if threadID != "" {
-		threadPart = `"thread_id":"` + threadID + `",`
+// threadGroupMsg 构造带 thread_id 的群消息（长连接路径产物）。
+func threadGroupMsg(threadID, rootID, text string) *channel.IncomingMessage {
+	return &channel.IncomingMessage{
+		Platform:  channel.PlatformFeishu,
+		UserID:    "ou_sender",
+		ChatID:    "oc_group",
+		ChatType:  channel.ChatGroup,
+		MessageID: "om_1",
+		Content:   text,
+		Meta: &channel.ChannelMessageMeta{
+			Provider: string(channel.PlatformFeishu),
+			ChatType: "group",
+			// 关键：解析层填 ThreadID 而非 ContextID（飞书用 thread_id）。
+			// nativeContextType 只在有 thread_id 时返回 "thread"。
+			NativeContextType: nativeContextType(threadID),
+			ThreadID:          threadID,
+			RootID:            rootID,
+			MessageID:         "om_1",
+			Text:              text,
+		},
 	}
-	rootPart := ""
-	if rootID != "" {
-		rootPart = `"root_id":"` + rootID + `",`
-	}
-	return `{
-		"header":{"token":"` + testToken + `","event_type":"im.message.receive_v1"},
-		"event":{
-			"message":{
-				"message_id":"om_1","chat_id":"oc_group","chat_type":"group",
-				"message_type":"text",
-				` + threadPart + rootPart + `
-				"content":"{\"text\":\"` + text + `\"}",
-				"create_time":"1"
-			},
-			"sender":{"sender_id":{"open_id":"ou_sender"}}
-		}
-	}`
-}
-
-// parseOne 走 HTTP 边界拿到解析后的 IncomingMessage。
-func parseOne(t *testing.T, body string) *channel.IncomingMessage {
-	t.Helper()
-	r := newRecorder(VerifyConfig{VerificationToken: testToken})
-	if w := r.do(body); w.Code != 200 {
-		t.Fatalf("handler status = %d, want 200 (body=%s)", w.Code, body)
-	}
-	if r.messageCount() != 1 {
-		t.Fatalf("messageCount = %d, want 1", r.messageCount())
-	}
-	return r.messages[0]
 }
 
 // TestDemoPath_RouteEndToEnd 复现 issue #7 的两条 Demo path。
@@ -57,9 +43,7 @@ func TestDemoPath_RouteEndToEnd(t *testing.T) {
 	cfg := channel.RouteConfig{WorkspaceID: "ws1", BindingMode: channel.BindingThreadMap}
 
 	t.Run("① 同 chatID 不同渠道 → 不同会话", func(t *testing.T) {
-		// 真实链路上飞书侧只能拿到 feishu 渠道；另一渠道用同 chatID 的构造消息
-		// 代表「另一个平台解析出的同 chatID」。前缀差异是这里唯一的分野。
-		feishuMsg := parseOne(t, threadGroupEventJSON("", "", "hello"))
+		feishuMsg := threadGroupMsg("", "", "hello")
 
 		other := &channel.IncomingMessage{
 			Platform: channel.Platform("telegram"),
@@ -81,8 +65,8 @@ func TestDemoPath_RouteEndToEnd(t *testing.T) {
 	})
 
 	t.Run("② 同群两个话题 → 两个独立会话", func(t *testing.T) {
-		m1 := parseOne(t, threadGroupEventJSON("th_1", "root_1", "话题一"))
-		m2 := parseOne(t, threadGroupEventJSON("th_2", "root_2", "话题二"))
+		m1 := threadGroupMsg("th_1", "root_1", "话题一")
+		m2 := threadGroupMsg("th_2", "root_2", "话题二")
 
 		r1 := channel.ResolveRoute(cfg, m1)
 		r2 := channel.ResolveRoute(cfg, m2)
@@ -90,7 +74,6 @@ func TestDemoPath_RouteEndToEnd(t *testing.T) {
 		if r1.EffectiveJID == r2.EffectiveJID {
 			t.Fatalf("two threads must not share a session: both = %q", r1.EffectiveJID)
 		}
-		// 会话隔离 = 历史隔离：以 effectiveJID 为键，键不同则看不到彼此历史。
 		if r1.EffectiveJID != "feishu:ws1#oc_group#thread:th_1#root:root_1" {
 			t.Errorf("thread1 route = %q", r1.EffectiveJID)
 		}
@@ -107,11 +90,9 @@ func TestDemoPath_RouteEndToEnd(t *testing.T) {
 	})
 
 	t.Run("③ 无 thread_id 的群消息不分流", func(t *testing.T) {
-		// 真实链路验证保守判定：飞书普通群消息没有 thread_id，
-		// 解析层 nativeContextType 返回 ""，路由层据此走普通会话。
-		m := parseOne(t, threadGroupEventJSON("", "", "普通消息"))
+		m := threadGroupMsg("", "", "普通消息")
 		if m.Meta == nil {
-			t.Fatal("Meta must be populated by the parser")
+			t.Fatal("Meta must be populated")
 		}
 		if m.Meta.NativeContextType != "" {
 			t.Errorf("NativeContextType = %q, want empty for a non-thread message", m.Meta.NativeContextType)
@@ -132,7 +113,7 @@ func TestDemoPath_RouteEndToEnd(t *testing.T) {
 // 第二档（threadId）因此在真实链路上生效——这个测试防止有人「顺手」把
 // 解析层改成填 ContextID 而破坏跨平台契约的一致性。
 func TestRoute_ParserFeedsThreadIdentity(t *testing.T) {
-	m := parseOne(t, threadGroupEventJSON("th_9", "root_9", "x"))
+	m := threadGroupMsg("th_9", "root_9", "x")
 	if m.Meta.ThreadID != "th_9" {
 		t.Errorf("Meta.ThreadID = %q, want %q", m.Meta.ThreadID, "th_9")
 	}

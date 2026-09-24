@@ -8,23 +8,12 @@ import "github.com/kalandramo/TaiJi/internal/config"
 // config 侧负责「工作区不得覆盖」，本包负责「从受信配置读取」。
 // 两处字面量的一致性由 TestCredentialEnvKeysMatchConfigGuard 锁住——
 // 漂移会让「受保护」与「实际读取」脱节，形成静默的凭据缺口。
-const (
-	// EnvVerificationToken 是 webhook 验签口令（必需）。
-	EnvVerificationToken = "FEISHU_VERIFICATION_TOKEN"
-	// EnvEncryptKey 是事件解密口令（可选，配了才能收加密事件）。
-	EnvEncryptKey = "FEISHU_ENCRYPT_KEY"
-)
-
-// VerifyConfigFromEnv 从受信配置快照构建验签凭据。
 //
-// 入参应是 config.Load 的产物——即已经过保留键过滤的配置。
-// 凭据不落配置文件（NFR-9.1），只从启动环境来。
-func VerifyConfigFromEnv(cfg map[string]string) VerifyConfig {
-	return VerifyConfig{
-		VerificationToken: cfg[EnvVerificationToken],
-		EncryptKey:        cfg[EnvEncryptKey],
-	}
-}
+// **webhook 专属凭据已不再读取**（FEISHU_VERIFICATION_TOKEN / FEISHU_ENCRYPT_KEY）：
+// 原型只用长连接，而长连接不验签（信任 SDK 与飞书的 TLS 通道，
+// docs/03-原型设计文档.md:119）。这两个键在 config.CredentialKeys 中保留——
+// 移除它们会削弱将来重加 webhook 的保护基线，且留着无成本。
+// 对应的常量定义（EnvVerificationToken / EnvEncryptKey）随 webhook 实现一并删除。
 
 // credentialEnvKeys 列出本包读取的全部凭据键，供一致性测试遍历。
 //
@@ -35,10 +24,8 @@ func VerifyConfigFromEnv(cfg map[string]string) VerifyConfig {
 // config.CredentialKeys 加了保护，但这里没同步——自检形同虚设。
 // TestCredentialEnvKeysCoverConfigGuard 现在锁定反向一致性，防复发。
 var credentialEnvKeys = []string{
-	EnvVerificationToken, // webhook 验签
-	EnvEncryptKey,        // webhook 事件解密
-	EnvAppID,             // 出站与长连接（issue #9）
-	EnvAppSecret,         // 出站与长连接（issue #9）
+	EnvAppID,     // 出站与长连接（issue #9）
+	EnvAppSecret, // 出站与长连接（issue #9）
 }
 
 // EnsureCredentialKeysProtected 断言本包读取的凭据键都受 config 层保护。

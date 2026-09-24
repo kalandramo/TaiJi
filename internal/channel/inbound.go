@@ -3,40 +3,16 @@
 // 依据设计文档 §4.4.1（docs/03-原型设计文档.md:437）拆为两层：
 //
 //   - 连接层 Channel：长驻连接的建立 / 出站 / 收尾
-//   - 入站层 InboundSource：HTTP 回调 → 统一消息（本文件）
+//   - 入站层（本文件）：平台事件 → 统一消息契约
 //
 // 分层根因：飞书有两种接入形态。webhook 是「被推送」——需要验签的 HTTP 入口；
 // 长连接是「主动拉」——SDK 回调直出消息，没有 HTTP 入口，因而不需要验签。
-// 单接口会迫使长连接模式实现三个永不调用的空方法。
 //
-// 本包只定义入站层。连接层接口依赖出站（SendMessage）与长连接（#9 范围），
-// 此处不定义——避免制造「接口完整、实现残缺」的假象（见 issue #5 的范围声明：
-// 只做 webhook 入站，出站与端到端闭环见后续 Issue）。
+// **webhook 形态已移除**（原型只用长连接）：原先的 InboundSource 接口
+// （VerifyCallback / ParseCallback / HandleURLVerification）随之删除——
+// 它只为 webhook 服务，长连接路径从不经过它。本文件现只保留两种形态
+// 共用的消息契约。
 package channel
-
-import "net/http"
-
-// InboundSource 仅 webhook 模式的渠道需要实现。
-//
-// 长连接模式的入站由 SDK 回调直接产出 IncomingMessage，不经此接口。
-// 依据：docs/03-原型设计文档.md:481（§4.4.1），对照 WeKnora internal/im/adapter.go:126-144。
-type InboundSource interface {
-	// VerifyCallback 验签（失败返回 error，调用方回 403）。
-	//
-	// 安全语义：这是渠道层唯一的信任边界。实现必须 fail-closed——
-	// 凭据未配置时拒绝，而不是跳过校验。
-	VerifyCallback(r *http.Request) error
-
-	// ParseCallback 解析为统一消息；非消息事件返回 nil。
-	//
-	// 前置条件：VerifyCallback 已通过。主体 ID 必须取自平台元数据，
-	// 不得由调用方参数决定（FR-10.2）。
-	ParseCallback(r *http.Request) (*IncomingMessage, error)
-
-	// HandleURLVerification 处理平台首次配置的挑战请求。
-	// 返回 true 表示该请求是挑战请求且已应答，调用方不应继续解析。
-	HandleURLVerification(w http.ResponseWriter, r *http.Request) bool
-}
 
 // Platform 是渠道平台标识。
 // 多渠道路由需要它来构造带前缀的会话标识（防跨渠道 chatID 撞车，FR-10.2）。

@@ -20,7 +20,8 @@ func TestCredentialEnvKeysMatchConfigGuard(t *testing.T) {
 }
 
 func TestCredentialEnvKeysCoverConfigGuard(t *testing.T) {
-	// **反向**一致性：config 层保护的每个 FEISHU_* 键，本包都必须登记。
+	// **反向**一致性：config 层保护的每个 FEISHU_* 键，本包要么登记、
+	// 要么属于**已知的 webhook 专属键**。
 	//
 	// 为什么需要反向断言：只验「本包读的 ⊆ config 保护的」时，
 	// **漏登记是静默的**——新增凭据键只加 config 侧保护、忘了加进
@@ -29,7 +30,14 @@ func TestCredentialEnvKeysCoverConfigGuard(t *testing.T) {
 	// FEISHU_APP_ID/FEISHU_APP_SECRET 加了 config 保护但漏了登记，
 	// 自检形同虚设，且没有任何测试报警。
 	//
-	// 加上反方向后，两侧任一漂移都会失败。
+	// webhook 实现删除后（原型只用长连接），那两个键不再被本包读取，
+	// 但保护保留——故它们列入豁免集，而非从 config 侧移除。
+	// 豁免是**显式列举**的：新增未登记键仍会失败，缺口不会被豁免掩盖。
+	webhookOnly := map[string]struct{}{
+		"FEISHU_VERIFICATION_TOKEN": {}, // webhook 验签（实现已删，保护保留）
+		"FEISHU_ENCRYPT_KEY":        {}, // webhook 解密（同上）
+	}
+
 	registered := make(map[string]struct{}, len(credentialEnvKeys))
 	for _, k := range credentialEnvKeys {
 		registered[k] = struct{}{}
@@ -39,6 +47,9 @@ func TestCredentialEnvKeysCoverConfigGuard(t *testing.T) {
 		// 只看本渠道命名空间的键：config 层可能为将来的渠道留了键
 		// （如其它平台的凭据），那些不该由 feishu 包登记。
 		if !strings.HasPrefix(k, "FEISHU_") {
+			continue
+		}
+		if _, exempt := webhookOnly[k]; exempt {
 			continue
 		}
 		if _, ok := registered[k]; !ok {
@@ -54,28 +65,15 @@ func TestEnsureCredentialKeysProtected_Passes(t *testing.T) {
 	}
 }
 
-func TestVerifyConfigFromEnv(t *testing.T) {
-	got := VerifyConfigFromEnv(map[string]string{
-		EnvVerificationToken: "tok",
-		EnvEncryptKey:        "key",
-	})
-	if got.VerificationToken != "tok" {
-		t.Errorf("VerificationToken = %q, want tok", got.VerificationToken)
-	}
-	if got.EncryptKey != "key" {
-		t.Errorf("EncryptKey = %q, want key", got.EncryptKey)
-	}
-}
-
-func TestVerifyConfigFromEnv_MissingKeysAreEmpty(t *testing.T) {
-	got := VerifyConfigFromEnv(map[string]string{"OTHER": "x"})
-	if got.VerificationToken != "" || got.EncryptKey != "" {
-		t.Errorf("got %+v, want empty credentials", got)
-	}
-	// 空凭据的语义由 VerifyCallback 定义：拒绝一切（fail-closed）。
-	s := NewSource(got)
-	if err := s.VerifyCallback(postRequest(`{}`)); err == nil {
-		t.Fatal("empty credentials must not verify anything")
+// webhook 专属的 VerifyConfigFromEnv 测试已随实现删除。
+// 保留一条断言：那两个键**仍受 config 层保护**（webhook 实现删了，
+// 但保护基线不撤——将来重加 webhook 时不必重新发现这个坑）。
+func TestWebhookCredentialsRemainProtected(t *testing.T) {
+	for _, k := range []string{"FEISHU_VERIFICATION_TOKEN", "FEISHU_ENCRYPT_KEY"} {
+		if _, ok := config.CredentialKeys[k]; !ok {
+			t.Errorf("config.CredentialKeys 应保留 %q 的保护（webhook 实现已删，"+
+				"但保护基线不撤——将来重加时不必重新发现）", k)
+		}
 	}
 }
 

@@ -3,8 +3,6 @@ package feishu
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
 
 	"github.com/kalandramo/TaiJi/internal/channel"
 )
@@ -66,65 +64,6 @@ type eventMention struct {
 
 type mentionID struct {
 	OpenID string `json:"open_id"`
-}
-
-// ParseCallback 把飞书回调解析为统一消息。
-//
-// 非消息事件返回 (nil, nil)——「不是消息」不是错误，调用方据此静默跳过。
-// 消息事件缺少必需字段才返回 error（fail-closed：宁可不产出消息，
-// 也不产出字段残缺、让下游误判的消息）。
-//
-// **主体解析的防线**（FR-10.2）：本方法的入参只有 *http.Request，
-// 没有任何「传入身份」的参数位——主体 ID 只能来自事件体元数据。
-// 依据：docs/03-原型设计文档.md:641（§4.4.5）。
-func (s *Source) ParseCallback(r *http.Request) (*channel.IncomingMessage, error) {
-	body, err := readAndRestore(r)
-	if err != nil {
-		return nil, fmt.Errorf("feishu: read body: %w", err)
-	}
-
-	raw, err := s.decryptIfNeeded(body)
-	if err != nil {
-		return nil, err
-	}
-
-	var ev callbackEvent
-	if err := json.Unmarshal(raw, &ev); err != nil {
-		return nil, fmt.Errorf("feishu: unmarshal callback: %w", err)
-	}
-
-	if ev.Header == nil || ev.Header.EventType != eventTypeMessage {
-		return nil, nil // 非消息事件
-	}
-	if ev.Event == nil || ev.Event.Message == nil {
-		return nil, errors.New("feishu: message event has no message payload")
-	}
-
-	openID, err := extractOpenID(ev.Event.Sender)
-	if err != nil {
-		return nil, err
-	}
-
-	msg := ev.Event.Message
-	text := extractText(msg.Content)
-	return &channel.IncomingMessage{
-		Platform:  channel.PlatformFeishu,
-		UserID:    openID,
-		ChatID:    msg.ChatID,
-		ChatType:  normalizeChatType(msg.ChatType),
-		MessageID: msg.MessageID,
-		Content:   text,
-		Mentions:  extractMentions(msg.Mentions),
-		Meta: &channel.ChannelMessageMeta{
-			Provider:          string(channel.PlatformFeishu),
-			ChatType:          msg.ChatType, // 平台原值，归一化值在 ChatType 字段
-			NativeContextType: nativeContextType(msg.ThreadID),
-			ThreadID:          msg.ThreadID,
-			RootID:            msg.RootID,
-			MessageID:         msg.MessageID,
-			Text:              text,
-		},
-	}, nil
 }
 
 // extractOpenID 从 sender 元数据取主体 ID。

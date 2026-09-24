@@ -2,30 +2,29 @@ package server_test
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/channel"
-	"github.com/kalandramo/TaiJi/internal/channel/feishu"
 	"github.com/kalandramo/TaiJi/internal/server"
 )
 
 // 身份贯通的端到端验证。
 //
 // 要证明的链路：
-//   飞书消息（sender open_id）→ 门禁 → 管道注入 runCtx
+//   平台消息（sender open_id）→ 门禁 → 管道注入 runCtx
 //     → executor.Execute(ctx,...) 读到该 open_id
+//
+// **驱动方式已从 webhook 改为直投 Dispatcher**：原型只用长连接，
+// webhook 实现已删除。长连接路径的真实形态是 SDK 回调产出
+// IncomingMessage 后直接 Enqueue（longconn.go），故这里直接构造并投递。
 //
 // 为什么必须端到端：注入点在 pipeline，消费点在下游。单元测试证明不了
 // "注入的值真的到了消费端"——那是接线问题。
 //
-// 复用 e2e_test.go 的 eventJSON / allowAllGate / testToken / recordingSender，
-// 只把 executor 换成会记录身份的版本。
+// 复用 e2e_test.go 的 allowAllGate / recordingSender / contains。
 
 // principalRecordingExecutor 记录 Execute 收到的 ctx 中的主体身份。
 type principalRecordingExecutor struct {
@@ -54,7 +53,7 @@ func (e *principalRecordingExecutor) snapshot() ([]string, []bool) {
 }
 
 // newPrincipalHarness 构造用 principalRecordingExecutor 的夹具。
-func newPrincipalHarness(t *testing.T) (*principalRecordingExecutor, func(string) int) {
+func newPrincipalHarness(t *testing.T) (*principalRecordingExecutor, *server.Dispatcher) {
 	t.Helper()
 
 	exec := &principalRecordingExecutor{}
@@ -79,18 +78,26 @@ func newPrincipalHarness(t *testing.T) (*principalRecordingExecutor, func(string
 	}
 	t.Cleanup(d.Stop)
 
-	h := feishu.NewHandler(feishu.HandlerConfig{
-		Verify:    feishu.VerifyConfig{VerificationToken: testToken},
-		OnMessage: d.Enqueue,
-	})
+	return exec, d
+}
 
-	post := func(body string) int {
-		req := httptest.NewRequest(http.MethodPost, "/webhook/feishu", strings.NewReader(body))
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, req)
-		return w.Code
+// msgWithSender 构造带指定发送者 open_id 的消息。
+func msgWithSender(messageID, chatID, openID string, chatType channel.ChatType, mentions []channel.Mention) *channel.IncomingMessage {
+	return &channel.IncomingMessage{
+		Platform:  channel.PlatformFeishu,
+		UserID:    openID,
+		ChatID:    chatID,
+		ChatType:  chatType,
+		MessageID: messageID,
+		Content:   "你好",
+		Mentions:  mentions,
+		Meta: &channel.ChannelMessageMeta{
+			Provider:  string(channel.PlatformFeishu),
+			ChatType:  string(chatType),
+			MessageID: messageID,
+			Text:      "你好",
+		},
 	}
-	return exec, post
 }
 
 // waitExecutions 等执行次数达到 n。
@@ -107,11 +114,10 @@ func waitExecutions(exec *principalRecordingExecutor, n int, timeout time.Durati
 
 // 私聊消息的 open_id 必须到达执行层。
 func TestPrincipalE2E_SenderIDReachesExecutor(t *testing.T) {
-	exec, post := newPrincipalHarness(t)
+	exec, d := newPrincipalHarness(t)
 
-	// 私聊（chat_type=p2p）；eventJSON 里 sender open_id 是 "ou_sender"
-	if code := post(eventJSON("om_principal_1", "", "p2p", "你好", "")); code != 200 {
-		t.Fatalf("webhook 返回 %d, want 200", code)
+	if err := d.Enqueue(msgWithSender("om_principal_1", "", "ou_sender", channel.ChatDirect, nil)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
 	}
 	waitExecutions(exec, 1, 3*time.Second)
 
@@ -122,7 +128,7 @@ func TestPrincipalE2E_SenderIDReachesExecutor(t *testing.T) {
 	if !hasID[0] {
 		t.Fatal("执行器未收到主体身份 —— 身份未贯通到执行层")
 	}
-	if !strings.Contains(ids[0], "ou_sender") {
+	if !contains(ids[0], "ou_sender") {
 		t.Errorf("主体 ID = %q，应含发送者 open_id \"ou_sender\"", ids[0])
 	}
 	t.Logf("✓ 执行层收到主体身份: %s", ids[0])
@@ -130,13 +136,13 @@ func TestPrincipalE2E_SenderIDReachesExecutor(t *testing.T) {
 
 // 不同发送者 → 不同主体 ID（防"所有用户同一身份"）。
 func TestPrincipalE2E_DifferentSendersDifferentIDs(t *testing.T) {
-	exec, post := newPrincipalHarness(t)
+	exec, d := newPrincipalHarness(t)
 
-	b1 := strings.Replace(eventJSON("om_p_a", "", "p2p", "hi", ""), "ou_sender", "ou_alice", 1)
-	b2 := strings.Replace(eventJSON("om_p_b", "", "p2p", "hi", ""), "ou_sender", "ou_bob", 1)
-
-	if post(b1) != 200 || post(b2) != 200 {
-		t.Fatal("投递失败")
+	if err := d.Enqueue(msgWithSender("om_p_a", "", "ou_alice", channel.ChatDirect, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Enqueue(msgWithSender("om_p_b", "", "ou_bob", channel.ChatDirect, nil)); err != nil {
+		t.Fatal(err)
 	}
 	waitExecutions(exec, 2, 3*time.Second)
 
@@ -155,13 +161,12 @@ func TestPrincipalE2E_DifferentSendersDifferentIDs(t *testing.T) {
 
 // 群聊消息的发送者身份同样要到达（群聊走 @ 判定路径，但身份不能丢）。
 func TestPrincipalE2E_GroupMessageCarriesSender(t *testing.T) {
-	exec, post := newPrincipalHarness(t)
+	exec, d := newPrincipalHarness(t)
 
-	// 群聊 + @ bot（botOpenID 见 allowAllGate = "ou_bot"）
-	mentions := `[{"key":"@_user_1","id":{"open_id":"ou_bot"},"name":"bot"}]`
-	body := eventJSON("om_principal_g", "oc_group1", "group", "hi", mentions)
-	if code := post(body); code != 200 {
-		t.Fatalf("webhook 返回 %d, want 200", code)
+	mentions := []channel.Mention{{OpenID: "ou_bot", Key: "@_user_1", Name: "bot"}}
+	msg := msgWithSender("om_principal_g", "oc_group1", "ou_sender", channel.ChatGroup, mentions)
+	if err := d.Enqueue(msg); err != nil {
+		t.Fatalf("Enqueue: %v", err)
 	}
 	waitExecutions(exec, 1, 3*time.Second)
 
@@ -172,7 +177,7 @@ func TestPrincipalE2E_GroupMessageCarriesSender(t *testing.T) {
 	if !hasID[0] {
 		t.Fatal("群聊消息的身份未到达执行层")
 	}
-	if !strings.Contains(ids[0], "ou_sender") {
+	if !contains(ids[0], "ou_sender") {
 		t.Errorf("主体 ID = %q，应含发送者 open_id", ids[0])
 	}
 	t.Logf("✓ 群聊身份到达: %s", ids[0])

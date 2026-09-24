@@ -11,17 +11,14 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"sort"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
@@ -275,8 +272,9 @@ func mcpHeadersFor(serverName string) map[string]string {
 
 func runServe(args []string) int {
 	fs, cfg := newFlagSet("serve", "启动渠道服务")
-	addr := fs.String("addr", ":8080", "监听地址")
-	mode := fs.String("feishu-mode", "webhook", "接入形态：webhook（默认，需公网 URL）| longconn（长连接，只需出网）")
+	// 默认 longconn：webhook 形态已移除，保留 webhook 作默认值会让
+	// 不传参数时直接报错（那是个容易漏的坑）。
+	mode := fs.String("feishu-mode", "longconn", "接入形态：longconn（长连接，只需出网）。webhook 形态已移除")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -287,19 +285,20 @@ func runServe(args []string) int {
 	}
 	printControlValues(loaded)
 
+	// 参数校验**先于装配**：否则传了不支持的 mode 时，用户会先看到
+	// 装配阶段的错误（如缺凭据），而非「模式已移除」——误导排查方向。
+	if *mode != "longconn" {
+		fmt.Fprintf(os.Stderr,
+			"taiji serve: 未知 --feishu-mode=%q（仅支持 longconn——webhook 形态已移除）\n", *mode)
+		return 2
+	}
+
 	// 凭据链自检：本包读取的凭据键必须都受 config 层保护，
 	// 否则工作区文件可覆盖凭据（凭据劫持）。启动期暴露优于运行期发现。
 	if err := feishu.EnsureCredentialKeysProtected(); err != nil {
 		fmt.Fprintf(os.Stderr, "taiji serve: %v\n", err)
 		return 1
 	}
-
-	// 凭据来自受信配置（已过滤保留键），不落配置文件。
-	//
-	// 注意：webhook 专属的验签凭据检查**不在这里**——它在 webhook 分支内。
-	// 长连接模式不验签（信任来自 SDK 与飞书的 TLS 通道，§2.2），
-	// 在此处检查会打印一条误导性警告（「webhook 端点将拒绝所有回调」），
-	// 而长连接模式下根本没有 webhook 端点。
 
 	// ── 端到端管道装配（issue #9）──
 	// 把各层串起来：门禁 → 路由 → 串行化 → 执行 → 出站。
@@ -324,89 +323,12 @@ func runServe(args []string) int {
 	// ── 长连接模式（issue #9 Wave 5，AC-6）──
 	// 长连接无需验签（信任来自 SDK 与飞书的 TLS 通道，§2.2），
 	// 也无需公网入口——只需出网。适用于内网部署与本地开发。
-	if *mode == "longconn" {
-		return runLongConn(loaded, pipeline, dispatcher)
-	}
-	if *mode != "webhook" {
-		fmt.Fprintf(os.Stderr, "taiji serve: 未知 --feishu-mode=%q（支持 webhook | longconn）\n", *mode)
-		return 2
-	}
-
-	// webhook 专属：验签凭据检查（长连接不需要，见上方注释）。
-	verifyCfg := feishu.VerifyConfigFromEnv(loaded)
-	if verifyCfg.VerificationToken == "" {
-		// fail-closed：不配置就不启动，而不是启动一个拒绝一切请求的端点
-		// 让运维以为服务已就绪。这里把「配置缺失」和「端点拒绝」分开表达。
-		fmt.Fprintf(os.Stderr,
-			"taiji serve: %s 未配置——webhook 端点将拒绝所有回调（fail-closed）。\n"+
-				"  设置方式：在启动环境中导出该变量（凭据不写配置文件，见设计文档 §4.6）。\n",
-			feishu.EnvVerificationToken)
-	}
-
-	h := feishu.NewHandler(feishu.HandlerConfig{
-		Verify: verifyCfg,
-		OnMessage: func(m *channel.IncomingMessage) error {
-			// 异步投递：**立即返回**，不阻塞 HTTP 响应。
-			//
-			// agent 跑一轮要数秒，远超飞书的事件响应窗口。同步处理会让
-			// 端点超时 → 平台重投 → 重复处理。正确形态是先回 200 再后台处理。
-			//
-			// 队列满时返回错误 → 端点回 500 → 平台重试。这比无界队列
-			// 吃光内存要好（见 server.Dispatcher 的文档）。
-			if err := dispatcher.Enqueue(m); err != nil {
-				return err
-			}
-			return nil
-		},
-	})
-
-	mux := http.NewServeMux()
-	mux.Handle(h.Path(), h)
-
-	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		// 飞书事件体很小，限制请求体防内存耗尽。
-		ReadTimeout: 30 * time.Second,
-	}
-
-	ctx, cancel := signalContext()
-	defer cancel()
-
-	// 启动后即打印端点，让运维能确认「监听在哪里」而不是靠猜。
-	fmt.Fprintf(os.Stderr, "taiji serve: 监听 %s，webhook 路径 %s\n", *addr, h.Path())
-
-	errc := make(chan error, 1)
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errc <- err
-			return
-		}
-		errc <- nil
-	}()
-
-	select {
-	case err := <-errc:
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "taiji serve: %v\n", err)
-			return 1
-		}
-	case <-ctx.Done():
-		fmt.Fprintln(os.Stderr, "\ntaiji serve: 收到中断信号，正在关闭…")
-		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelShutdown()
-		// 顺序：先停 HTTP（不再收新请求），再停分发器（等在途消息处理完）。
-		// 反过来的话，Shutdown 期间到达的请求会被投进已关闭的队列。
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			fmt.Fprintf(os.Stderr, "taiji serve: 关闭失败: %v\n", err)
-			return 1
-		}
-		// HTTP 已停，等在途消息处理完再退出——否则已回 200 的消息被静默丢弃。
-		dispatcher.Stop()
-		fmt.Fprintln(os.Stderr, "taiji serve: 已关闭")
-	}
-	return 0
+	//
+	// **webhook 形态已移除**：原型只用长连接。原 webhook 分支
+	// （HTTP 端点 + 验签 + URL 挑战应答）及其凭据检查随之删除。
+	// 若将来需要 webhook，可从 git 历史恢复，并注意它需要公网入口。
+	// 模式校验已提前到装配之前（见上）。
+	return runLongConn(loaded, pipeline, dispatcher)
 }
 
 // printControlValues 打印保留键的最终生效值。
