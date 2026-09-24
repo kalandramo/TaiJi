@@ -106,9 +106,37 @@ func (e *Executor) AllowedTools() []string {
 // 实测教训：真实平台首次运行即报 "sessionID is required"（trpc 拒绝空值），
 // 正是这条校验把它从「静默串话」变成了「显式失败」。
 //
+// Execute 执行单轮，返回完整回答。
+//
+// sessionID 决定历史归属：同一 sessionID 的多轮会带上彼此的历史，
+// 不同 sessionID 互相隔离。调用方（服务端）应传**会话级**的稳定标识
+// （如路由后的 effectiveJID），而不是每次生成新值——否则历史无法延续。
+//
+// 空 sessionID 返回错误而非补默认值：CLI 的 Run 会补 cli-<ts>（因为它
+// 只有单一交互会话），但服务端漏传 sessionID 是**装配缺陷**——补默认值
+// 会让所有会话共用一份历史，静默串话。
+//
 // ctx 取消会让本次执行提前结束并返回错误——服务端在进程退出时
 // 依赖这条路径让在途请求收尾。
+//
+// 等价于 ExecuteStream(ctx, sessionID, input, nil)——保留该签名是因为
+// 既有调用点（CLI 与多个测试）不需要流式，加参数会波及 8+ 处。
 func (e *Executor) Execute(ctx context.Context, sessionID, input string) (string, error) {
+	return e.ExecuteStream(ctx, sessionID, input, nil)
+}
+
+// ExecuteStream 执行单轮，逐块回调并返回完整回答（issue #10）。
+//
+// onChunk 非 nil 时，每个内容块到达即回调——调用方据此做流式展示
+// （如更新飞书卡片）。onChunk 为 nil 时行为与 Execute 完全一致。
+//
+// **回调是同步的**：它在生成协程的调用栈内执行，慢回调会拖慢生成。
+// 调用方若需异步（如网络请求），应自行加 buffer + goroutine——
+// 本层不引入并发，因为那会让错误传递与生命周期管理复杂化。
+//
+// 回调里的 chunk 与返回的完整回答**拼接一致**：调用方可以只用 chunk
+// 展示、用返回值做最终态，两者不会分叉。
+func (e *Executor) ExecuteStream(ctx context.Context, sessionID, input string, onChunk func(string)) (string, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return "", ErrMissingSessionID
 	}
@@ -120,6 +148,9 @@ func (e *Executor) Execute(ctx context.Context, sessionID, input string) (string
 	var sb strings.Builder
 	if err := runOneTurn(ctx, e.asm.runner, e.asm.opts, sessionID, text, func(chunk string) {
 		sb.WriteString(chunk)
+		if onChunk != nil {
+			onChunk(chunk)
+		}
 	}); err != nil {
 		return "", err
 	}

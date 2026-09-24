@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/channel"
@@ -36,7 +37,20 @@ import (
 // 传空值会被实现拒绝——漏传 sessionID 是装配缺陷，显式失败优于
 // 让所有会话共用一份历史（静默串话）。
 type Executor interface {
+	// Execute 执行单轮，返回完整回答（无流式回调）。
+	//
+	// 保留此方法：它是不需要流式展示的调用方的入口，且既有实现与
+	// 测试 fake 无需改动语义。
 	Execute(ctx context.Context, sessionID, input string) (string, error)
+
+	// ExecuteStream 执行单轮，逐块回调并返回完整回答（issue #10）。
+	//
+	// onChunk 非 nil 时每个内容块到达即回调——管道据此更新飞书卡片。
+	// onChunk 为 nil 时行为与 Execute 一致。
+	//
+	// 回调**同步执行**：慢回调会拖慢生成。管道层负责节流（见
+	// pipeline.go 的 chunkThrottle），不让每个 token 都触发网络请求。
+	ExecuteStream(ctx context.Context, sessionID, input string, onChunk func(string)) (string, error)
 }
 
 // GateConfig 是门禁的静态配置部分（每次判定不变的量）。
@@ -179,8 +193,106 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 			msg.MessageID, msg.Platform)
 	}
 
-	// 先发占位消息，拿到 message_id 供后续更新（§4.4.1 的简化版流式）。
+	// ── 4. 执行 + 5. 出站 ──
+	//
+	// 两条路径（issue #10）：
+	//   A. 渠道支持流式卡片 → 开卡片流，逐块更新（打字机效果 + Markdown）
+	//   B. 否则（或不支持/失败）→ 既有「占位 → 更新」纯文本路径
+	//
+	// **卡片是增强，不是依赖**：任何一步失败都降级到 B，用户始终能得到回答。
+	// 设计文档 §4.4 定义了降级矩阵。
 	receiver, idType := receiverOf(msg)
+	return p.deliverAnswer(runCtx, target.EffectiveJID, msg, receiver, idType)
+}
+
+// deliverAnswer 执行并把回答投递到渠道（含卡片流式与文本降级）。
+//
+// 抽成独立方法的原因：路径分支（卡片/文本）+ 降级逻辑让 handle 方法过长，
+// 而这段逻辑可独立测试（给一个 fake StreamingSender 即可覆盖两条路径）。
+func (p *Pipeline) deliverAnswer(
+	runCtx context.Context,
+	sessionID string,
+	msg *channel.IncomingMessage,
+	receiver string,
+	idType channel.ReceiveIDType,
+) error {
+	// 尝试卡片流式路径。
+	if ss, ok := p.sender.(channel.StreamingSender); ok {
+		if err := p.streamViaCard(runCtx, ss, sessionID, msg, receiver, idType); err == nil {
+			return nil // 卡片路径成功
+		} else {
+			// 降级：记日志后走文本路径。**不返回错误**——卡片失败不该
+			// 让用户收不到回答（它是展示层增强）。
+			p.logf("server: card streaming failed, falling back to text message_id=%s err=%v",
+				msg.MessageID, err)
+		}
+	}
+	return p.deliverAsText(runCtx, sessionID, msg, receiver, idType)
+}
+
+// streamViaCard 用卡片流式投递（issue #10）。
+//
+// 返回 error 表示卡片路径不可用（调用方据此降级）；返回 nil 表示成功。
+func (p *Pipeline) streamViaCard(
+	runCtx context.Context,
+	ss channel.StreamingSender,
+	sessionID string,
+	msg *channel.IncomingMessage,
+	receiver string,
+	idType channel.ReceiveIDType,
+) error {
+	stream, err := ss.StartCardStream(runCtx, receiver, channel.SendOptions{
+		ReceiveIDType: idType,
+	})
+	if err != nil {
+		return fmt.Errorf("start card stream: %w", err)
+	}
+
+	// 节流器：避免每个 token 都触发网络请求（见 throttle.go）。
+	th := newChunkThrottle()
+
+	answer, execErr := p.executor.ExecuteStream(runCtx, sessionID, msg.Content,
+		func(chunk string) {
+			full := th.Add(chunk)
+			if !th.ShouldFlush(time.Now()) {
+				return
+			}
+			// 更新失败不中断生成——流结束时还有一次强制收尾。
+			if err := stream.Update(runCtx, full); err != nil {
+				p.logf("server: card update failed message_id=%s err=%v", msg.MessageID, err)
+				return
+			}
+			th.MarkSent(full, time.Now())
+		})
+
+	// 收尾：无论成功与否都要 Close，否则卡片停留在"生成中"。
+	final := answer
+	if execErr != nil {
+		final = "抱歉，处理时出错：" + execErr.Error()
+		p.logf("server: execute failed message_id=%s err=%v", msg.MessageID, execErr)
+	}
+	if final == "" {
+		final = th.Text() // 执行失败但已有部分内容时，保留已生成的
+	}
+	if err := stream.Close(runCtx, final); err != nil {
+		return fmt.Errorf("close card stream: %w", err)
+	}
+
+	if execErr != nil {
+		return fmt.Errorf("execute: %w", execErr)
+	}
+	return nil
+}
+
+// deliverAsText 是既有的「占位 → 更新」纯文本路径（issue #9）。
+func (p *Pipeline) deliverAsText(
+	runCtx context.Context,
+	sessionID string,
+	msg *channel.IncomingMessage,
+	receiver string,
+	idType channel.ReceiveIDType,
+) error {
+	// 先发占位消息，拿到 message_id 供后续更新（§4.4.1 的简化版流式）。
 	placeholderID, err := p.sender.SendMessage(runCtx, receiver, p.placeholder, channel.SendOptions{
 		ReceiveIDType: idType,
 	})
@@ -188,16 +300,7 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 		return fmt.Errorf("server: send placeholder: %w", err)
 	}
 
-	// 执行。
-	//
-	// sessionID 用 effectiveJID：它含渠道前缀与 workspace，天然是会话级
-	// 唯一键。同一会话的消息共享历史（AC-3 后半），不同会话互相隔离。
-	//
-	// **实测教训**（issue #9 Wave 6 真实平台验证）：此处最初传空值，
-	// trpc 报 "sessionID is required"，每条消息都失败。当时错误地以为
-	// sessionID 该由装配层统一设置——但它是 per-conversation 的，
-	// 必须在路由之后才能确定。
-	answer, execErr := p.executor.Execute(runCtx, target.EffectiveJID, msg.Content)
+	answer, execErr := p.executor.Execute(runCtx, sessionID, msg.Content)
 
 	// ── 5. 出站 ──
 	// 无论执行成功与否都要更新占位消息——否则用户会看到一条永远「思考中…」

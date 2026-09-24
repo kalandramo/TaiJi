@@ -78,6 +78,12 @@ type fakeExecutor struct {
 	events []string
 }
 
+// ExecuteStream 满足 server.Executor 接口（issue #10）。
+// 这些 fake 不测流式，故忽略 onChunk 直接委托 Execute。
+func (f *fakeExecutor) ExecuteStream(ctx context.Context, sessionID, input string, onChunk func(string)) (string, error) {
+	return f.Execute(ctx, sessionID, input)
+}
+
 func (f *fakeExecutor) Execute(ctx context.Context, sessionID, input string) (string, error) {
 	f.mu.Lock()
 	f.events = append(f.events, "enter:"+input)
@@ -385,6 +391,12 @@ func TestPipeline_ExecutesWithChannelContext(t *testing.T) {
 // recordingExecutor 记录执行时看到的 context kind。
 type recordingExecutor struct {
 	kind string
+}
+
+// ExecuteStream 满足 server.Executor 接口（issue #10）。
+// 这些 fake 不测流式，故忽略 onChunk 直接委托 Execute。
+func (r *recordingExecutor) ExecuteStream(ctx context.Context, sessionID, input string, onChunk func(string)) (string, error) {
+	return r.Execute(ctx, sessionID, input)
 }
 
 func (r *recordingExecutor) Execute(ctx context.Context, sessionID, input string) (string, error) {

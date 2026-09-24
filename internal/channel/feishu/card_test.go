@@ -271,3 +271,104 @@ func TestCard_ContentFailureReturnsError(t *testing.T) {
 		t.Fatal("内容更新失败应返回 error")
 	}
 }
+
+// ===== 契约适配：channel.StreamingSender =====
+
+// feishu.Sender 必须满足契约（编译期断言已在 card.go，此处验证运行时行为）。
+func TestCard_ImplementsStreamingSender(t *testing.T) {
+	f := &fakeCardkit{}
+	s, _ := newCardSender(t, f)
+
+	// 类型断言探测（管道就是这样用的）
+	var sender channel.Sender = s
+	ss, ok := sender.(channel.StreamingSender)
+	if !ok {
+		t.Fatal("feishu.Sender 应满足 channel.StreamingSender")
+	}
+
+	stream, err := ss.StartCardStream(context.Background(), "ou_user",
+		channel.SendOptions{ReceiveIDType: channel.ReceiveIDOpen})
+	if err != nil {
+		t.Fatalf("StartCardStream: %v", err)
+	}
+	if stream == nil {
+		t.Fatal("应返回非 nil 流")
+	}
+}
+
+// StartCardStream 应完成三步：创建卡片 → 发卡片消息 → 开启 streaming。
+func TestCard_StartCardStreamSequence(t *testing.T) {
+	f := &fakeCardkit{}
+	s, _ := newCardSender(t, f)
+
+	stream, err := s.StartCardStream(context.Background(), "ou_user",
+		channel.SendOptions{ReceiveIDType: channel.ReceiveIDOpen})
+	if err != nil {
+		t.Fatalf("StartCardStream: %v", err)
+	}
+	_ = stream
+
+	var paths []string
+	for _, c := range f.snapshot() {
+		paths = append(paths, c.Method+" "+c.Path)
+	}
+	// 断言三步都发生了
+	hasCreate, hasMsg, hasStreamingOn := false, false, false
+	for _, p := range paths {
+		if strings.Contains(p, "POST /open-apis/cardkit/v1/cards") && !strings.Contains(p, "/elements/") {
+			hasCreate = true
+		}
+		if strings.Contains(p, "POST /open-apis/im/v1/messages") {
+			hasMsg = true
+		}
+		if strings.Contains(p, "/settings") {
+			hasStreamingOn = true
+		}
+	}
+	if !hasCreate {
+		t.Error("应创建卡片实体")
+	}
+	if !hasMsg {
+		t.Error("应发送卡片消息")
+	}
+	if !hasStreamingOn {
+		t.Error("应开启 streaming 模式")
+	}
+	t.Logf("✓ 调用序列: %v", paths)
+}
+
+// Close 应先写最终内容，再关闭 streaming。
+func TestCard_CloseWritesFinalThenClosesStreaming(t *testing.T) {
+	f := &fakeCardkit{}
+	s, _ := newCardSender(t, f)
+
+	stream, err := s.StartCardStream(context.Background(), "ou_user",
+		channel.SendOptions{ReceiveIDType: channel.ReceiveIDOpen})
+	if err != nil {
+		t.Fatalf("StartCardStream: %v", err)
+	}
+	if err := stream.Close(context.Background(), "最终回答"); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 找出 close 后的调用：最后一个 content 更新应在最后一个 settings 之前
+	var contentIdx, settingsIdx []int
+	for i, c := range f.snapshot() {
+		if strings.HasSuffix(c.Path, "/content") {
+			contentIdx = append(contentIdx, i)
+		}
+		if strings.HasSuffix(c.Path, "/settings") {
+			settingsIdx = append(settingsIdx, i)
+		}
+	}
+	if len(contentIdx) == 0 || len(settingsIdx) < 2 {
+		t.Fatalf("调用不足：content=%v settings=%v", contentIdx, settingsIdx)
+	}
+	// 最后写入的 content 必须在最后一次 settings 之前（先写内容再关流式）
+	lastContent := contentIdx[len(contentIdx)-1]
+	lastSettings := settingsIdx[len(settingsIdx)-1]
+	if lastContent > lastSettings {
+		t.Errorf("最终内容应在关闭 streaming 之前写入（content@%d > settings@%d）", lastContent, lastSettings)
+	}
+	t.Logf("✓ content@%d 在 settings@%d 之前", lastContent, lastSettings)
+}

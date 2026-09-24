@@ -68,6 +68,12 @@ type echoExecutor struct {
 	seen []string
 }
 
+// ExecuteStream 满足 server.Executor 接口（issue #10）。
+// 这些 fake 不测流式，故忽略 onChunk 直接委托 Execute。
+func (e *echoExecutor) ExecuteStream(ctx context.Context, sessionID, input string, onChunk func(string)) (string, error) {
+	return e.Execute(ctx, sessionID, input)
+}
+
 func (e *echoExecutor) Execute(ctx context.Context, sessionID, input string) (string, error) {
 	e.mu.Lock()
 	e.seen = append(e.seen, input)
@@ -342,6 +348,12 @@ func TestE2E_EnqueueDoesNotBlockOnAgent(t *testing.T) {
 }
 
 type slowExecutor struct{ delay time.Duration }
+
+// ExecuteStream 满足 server.Executor 接口（issue #10）。
+// 这些 fake 不测流式，故忽略 onChunk 直接委托 Execute。
+func (s *slowExecutor) ExecuteStream(ctx context.Context, sessionID, input string, onChunk func(string)) (string, error) {
+	return s.Execute(ctx, sessionID, input)
+}
 
 func (s *slowExecutor) Execute(ctx context.Context, sessionID, input string) (string, error) {
 	select {

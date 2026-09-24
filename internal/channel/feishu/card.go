@@ -217,3 +217,57 @@ func (c *CardStream) AppendContent(ctx context.Context, text string) error {
 	}
 	return nil
 }
+
+// ── 实现 channel.StreamingSender 契约（issue #10）──
+//
+// 适配层：把契约的 StartCardStream/Update/Close 映射到 CardKit 的
+// CreateCardStream/SetStreaming/AppendContent。契约层不暴露 CardKit 概念
+// （card_id、sequence、element_id），调用方只管推送完整文本。
+
+// cardStreamAdapter 把 CardStream 适配为 channel.CardStream。
+type cardStreamAdapter struct {
+	inner *CardStream
+}
+
+// Update 推送当前完整文本。
+func (a *cardStreamAdapter) Update(ctx context.Context, text string) error {
+	return a.inner.AppendContent(ctx, text)
+}
+
+// Close 结束流式并写入最终内容。
+//
+// 顺序：先写最终内容再关 streaming_mode——反过来的话，关闭后平台可能
+// 忽略后续内容更新，最终态就丢了。
+//
+// 即使写入失败也尝试关闭 streaming_mode：卡片卡在"生成中"比内容不完整
+// 更糟（用户会一直等）。关闭失败才返回错误。
+func (a *cardStreamAdapter) Close(ctx context.Context, finalText string) error {
+	writeErr := a.inner.AppendContent(ctx, finalText)
+	closeErr := a.inner.SetStreaming(ctx, false)
+	if closeErr != nil {
+		return closeErr // 关闭失败更严重（卡片卡住）
+	}
+	return writeErr
+}
+
+// StartCardStream 实现 channel.StreamingSender。
+//
+// 两步：创建卡片实体 → 发送卡片消息。任一步失败都返回 error，
+// 调用方据此降级到纯文本（见设计文档 §4.4）。
+func (s *Sender) StartCardStream(ctx context.Context, to string, opts channel.SendOptions) (channel.CardStream, error) {
+	stream, err := s.CreateCardStream(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.SendCardMessage(ctx, to, stream.CardID(), opts); err != nil {
+		return nil, err
+	}
+	// 开启流式模式——之后才能接受 Content 更新。
+	if err := stream.SetStreaming(ctx, true); err != nil {
+		return nil, err
+	}
+	return &cardStreamAdapter{inner: stream}, nil
+}
+
+// 编译期断言：feishu.Sender 满足流式契约。
+var _ channel.StreamingSender = (*Sender)(nil)

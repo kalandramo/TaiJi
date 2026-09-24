@@ -33,6 +33,12 @@ type principalRecordingExecutor struct {
 	hasID []bool
 }
 
+// ExecuteStream 满足 server.Executor 接口（issue #10）。
+// 这些 fake 不测流式，故忽略 onChunk 直接委托 Execute。
+func (e *principalRecordingExecutor) ExecuteStream(ctx context.Context, sessionID, input string, onChunk func(string)) (string, error) {
+	return e.Execute(ctx, sessionID, input)
+}
+
 func (e *principalRecordingExecutor) Execute(ctx context.Context, sessionID, input string) (string, error) {
 	p, ok := authz.PrincipalFrom(ctx)
 	e.mu.Lock()
