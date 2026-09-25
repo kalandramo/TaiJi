@@ -311,7 +311,7 @@ FR-10.8（`01-需求文档.md:536`）：「绑定后**按系统角色判定权�
 
 > **关键**：RBAC 与 ContextKind 降权**叠加**，不是替代。
 > IM 用户即使有 `operator` 角色，`ContextKind=channel` 仍让写操作被拒
-> （前提是③上下文级被真正接线——见 §7 缺口 1）。
+> （③上下文级已接线——`ContextGuardPlugin`，见 §7 缺口 1）。
 
 ---
 
@@ -329,27 +329,38 @@ FR-10.8（`01-需求文档.md:536`）：「绑定后**按系统角色判定权�
 
 ---
 
-## 7. 已知缺口（本设计**不**解决，但必须点明）
+## 7. 缺口状态
 
-### 缺口 1：`RequireWritable` 零生产消费方（**最重**）
+### 缺口 1：`RequireWritable` 零生产消费方 —— **已接线**（2026-09-26）
 
-`grep` 全仓：`RequireWritable`（`context.go:62`）只在测试中出现，
-**无任何生产代码调用**。这意味着"IM 来源只读"目前是**声明而非执行**。
+**原缺口**：`RequireWritable`（`context.go:62`）只在测试中出现，无生产调用——
+"IM 来源只读"是**声明而非执行**。运行时探针曾确证：`KindChannel` 下工具照常执行。
 
-**已由运行时探针确证**（证据见 §10）：`ContextKind=channel` 的上下文中，
-工具**照常执行**（回答含工具返回值）——上下文级降权在 channel 下**零拦截**。
-现在安全只是因为工具白名单默认拒绝了所有工具，不是上下文降权生效。
+**修复**：新增 `internal/authz/context_guard.go` 的 `ContextGuardPlugin`，
+挂入 `newRunner` 的插件链（`execute.go`），成为 `RequireWritable` 的**执行点**。
 
-**与 RBAC 的关系**：RBAC 引入 `ws:modify` 等资源级权限点后，若③上下文级仍未接线，
-则「有 `ws:modify` 权限的 IM 用户」会绕过只读降权。**RBAC 会放大这个缺口**。
+**判定依据（协议级，非名字启发式）**：工具的只读性取自 `tool.MetadataOf`，
+其源头是 MCP 的 `readOnlyHint` 注解——经 `mcpTool.ToolMetadata()`（`tool/mcp/tool.go:86`）
+→ `NamedTool` 透传（`internal/tool/toolset.go:302`）→ `ag.Tools()`。**已实测**：
+mockmcp 的 `echo` 声明 `readOnlyHint=true` 后读到 `readOnly=true`。
 
-**建议**：RBAC v1 落地时，**同步**给 `RequireWritable` 找执行点（写工具注册时声明 /
-beforeTool 里按 action 前缀判定）。这是 RBAC 的前置条件，不是可选项。
+**不变量**：
+- 只读工具 → 任何上下文放行；
+- 写工具 → 仅 `KindInteractive` 放行，其余（含缺失 kind）拒绝（fail-closed）；
+- 表里没有的工具 → 视为写（新增工具不因缺注解而敞开）。
+
+**验证证据**：
+- 单测 `internal/authz/context_guard_test.go`：7 例（渠道写拒 / 渠道只读放 / 可写放 / 缺 kind 写拒 / 缺 kind 只读放 / 未知工具视为写 / nil args）；
+- e2e `internal/chat/context_guard_e2e_test.go`：4 例，**不 mock 中间层**（真实 MCP + 真实框架链路）。
+
+**残留**：CLI 路径已在 `chat.Run` 注入 `KindInteractive`（否则 CLI 写操作会被 fail-closed 拒绝）。
+`KindScheduled`/`KindSubagent` 仍无注入点（见缺口 2）。
 
 ### 缺口 2：`KindScheduled`/`KindSubagent` 是空壳
 
 `context.go:23-26` 定义了两个 kind，但无生产注入点，也无定时任务/子 agent 功能。
-将来做这两条路径时会踩与缺口 1 相同的坑。
+将来做这两条路径时，需在对应入口注入 kind——否则 `ContextGuardPlugin`
+会把它们的写操作 fail-closed 拒绝（这是**正确**的行为，但要记得注入可写 kind）。
 
 ### 缺口 3：用户级权限默认 fail-open
 
@@ -379,9 +390,11 @@ v1 引入 RBAC 时应**一并修正**——要么默认拒绝，要么启动期�
 - 装配：`cmd/taiji/main.go:679` 换 `envRBAC()`；
 - **验证**：单元测试覆盖「角色继承 / 通配 / 未绑定用户拒绝 / 空表拒绝」。
 
-### Wave 3：接线补缺（缺口 1+3）
+### Wave 3：接线补缺（缺口 3）—— 缺口 1 已于本次完成
 
-- `RequireWritable` 接执行点；
+> **缺口 1 已完成**（`ContextGuardPlugin`，见 §7）：`RequireWritable` 已接执行点。
+> 本波仅剩缺口 3。
+
 - 用户级默认改 fail-closed（或启动期强制校验）；
 - **验证**：端到端测试——IM 用户即使有角色，写操作仍被拒。
 
@@ -435,13 +448,17 @@ PROBE-ANSWER "工具返回：[{\"type\":\"text\",\"text\":\"Echo: 你好\"}]"
 **结论**：框架传给 `beforeTool` 的 ctx 是**原 ctx 对象**，非重建。
 → `WithResource(ctx, workspaceID)` 方案**可行**，`resource` 在 v1 即可有值（§3.3 已据此修订）。
 
-### 证据 2：上下文级降权零拦截（**确证缺口 1**）
+### 证据 2：上下文级降权零拦截（**确证缺口 1**——已于 2026-09-26 修复）
 
 探针在 `KindChannel` 上下文中放行工具，工具**照常执行**
 （`PROBE-ANSWER` 含 `Echo: 你好`，即 mockmcp 的真实返回值）。
 
 **结论**：`ContextKind=channel` 虽正确透传（`kind="channel"`），但**无任何代码读取它来拦截**。
-→ 缺口 1 从"静态推断"升级为"运行时事实"：IM 来源的写操作**当前不受上下文级保护**。
+→ 缺口 1 从"静态推断"升级为"运行时事实"：IM 来源的写操作**当时不受上下文级保护**。
+
+> **修复**：`ContextGuardPlugin`（`internal/authz/context_guard.go`）已接线，成为
+> `RequireWritable` 的执行点。修复后 e2e 复验：`KindChannel` + 写工具 → 拒绝；
+> 只读工具 → 放行（见 §7 缺口 1）。
 
 > **探针的边界（诚实标注）**：本探针用 `PermissionSource` 读 ctx，与真实
 > `PrincipalPolicyPlugin` 的 ctx 消费点同源（都是 `beforeTool` 回调），故结论可迁移。
@@ -463,7 +480,8 @@ PROBE-ANSWER "工具返回：[{\"type\":\"text\",\"text\":\"Echo: 你好\"}]"
 | `internal/authz/principal.go:34` | `Principal` 结构 |
 | `internal/authz/principal.go:103` | `ResolvePrincipal` |
 | `internal/authz/principal.go:129` | `IsOwner` |
-| `internal/authz/context.go:62` | `RequireWritable`（零消费方） |
+| `internal/authz/context.go:62` | `RequireWritable`（已有执行点：`ContextGuardPlugin`） |
+| `internal/authz/context_guard.go` | `ContextGuardPlugin`（上下文级降权的执行点，2026-09-26 新增） |
 | `internal/chat/chat.go:49` | `Options.Permissions` |
 | `internal/chat/execute.go:236` | 插件挂载点 |
 | `internal/server/pipeline.go:190` | `WithContextKind` 注入 |

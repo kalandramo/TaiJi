@@ -226,12 +226,20 @@ func newRunner(opts Options) (*assembly, error) {
 
 	// 插件按序串联，各管一个维度：
 	//   approval         部署级——哪些工具在本部署启用（装配期定死）
+	//   contextGuard     上下文级——来源是否允许写（IM 来源只读，§4.3.3）
 	//   principalPolicy  用户级——谁能用哪些工具（读 ctx 里的 Principal）
 	//
-	// 两个都要：部署级防止"未启用的工具被调用"，用户级防止"越权使用"。
-	// 顺序上部署级在前——它判定更便宜（纯内存查表），且被它拒的工具
-	// 无需再走用户级查询。
-	plugins := []plugin.Plugin{policy.Plugin()}
+	// 三者都要：部署级防止"未启用的工具被调用"，上下文级防止"只读来源越权写"，
+	// 用户级防止"越权使用"。顺序上部署级在前（纯内存查表、最便宜），
+	// 上下文级居中（查 metadata 表），用户级最后（可能查外部数据源）。
+	//
+	// contextGuard 用 agent 暴露的「模型可见工具」构造 name→只读 表——
+	// 只读性来自 MCP 的 readOnlyHint 注解（经 mcpTool.ToolMetadata 透传，
+	// 已实测验证）。未声明注解的工具视为写操作（fail-closed）。
+	plugins := []plugin.Plugin{
+		policy.Plugin(),
+		authz.NewContextGuardPlugin(ag.Tools(), opts.logf),
+	}
 	if opts.Permissions != nil {
 		plugins = append(plugins, authz.NewPrincipalPolicyPlugin(opts.Permissions, opts.logf))
 	}

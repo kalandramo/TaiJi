@@ -88,6 +88,13 @@ func Run(ctx context.Context, in io.Reader, opts Options) error {
 		opts.SessionID = fmt.Sprintf("cli-%d", time.Now().Unix())
 	}
 
+	// CLI 是交互式会话，是可写上下文（§4.3.3 的 ContextKind 表）。
+	// 必须注入，否则上下文级守卫会把 CLI 的写操作 fail-closed 拒绝。
+	// 仅在缺失时注入——尊重调用方已显式设置的 kind（便于测试）。
+	if _, ok := authz.ContextKindFrom(ctx); !ok {
+		ctx = authz.WithContextKind(ctx, authz.KindInteractive)
+	}
+
 	// 装配走 execute.go 的共用路径——CLI 与服务端必须用完全相同的
 	// 模型/agent/工具策略装配，否则两者行为分叉且难以在测试中发现。
 	asm, err := newRunner(opts)
