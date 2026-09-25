@@ -142,12 +142,12 @@ RBAC 只接管"②权限级"的判定，不碰"①渠道级"的 owner 判定。
 ```go
 // AccessRequest 是一次权限查询的完整上下文。
 //
-// 从 (principal, toolName) 扩为三元组，是为了让「资源级」判定在 v2
-// 无需二次改接口——v1 只需填 action=toolName、resource=""。
+// 从 (principal, toolName) 扩为三元组，是为了让「资源级」判定
+// 无需二次改接口——v1 填 action=toolName、resource=工作区 ID（见 §3.3）。
 type AccessRequest struct {
     Principal Principal // 谁
     Action    string    // 做什么（v1：工具名；v2：动作如 "fs.write"）
-    Resource  string    // 对什么（v1：空；v2：工作区 ID / 路径 / 参数摘要）
+    Resource  string    // 对什么（v1：工作区 ID；v2：细化到路径 / 参数摘要）
 }
 
 type PermissionSource interface {
@@ -172,23 +172,25 @@ type PermissionSource interface {
 即：消费方 `permission_plugin.go:52` 的 `beforeTool` 能拿到工具参数，
 未来可从中提取 resource（如 `fs_write` 的路径参数）。
 
-### 3.3 v1 的 resource 语义——诚实标注
+### 3.3 v1 的 resource 语义——**探针验证后修订**
 
-**v1 的 `resource` 恒为空串**，因为：
+> **本节经运行时探针修订**。原稿断言「v1 的 `resource` 恒为空，因为 `beforeTool`
+> 拿不到 route 信息」——该断言**已被探针推翻**（证据见 §10）。
 
-- IM 渠道的 resource 天然是**当前工作区**（`pipeline.go:226` 的 `p.route.WorkspaceID` 已有）；
-- 但 v1 权限判定在 `beforeTool` 里，该处**拿不到** pipeline 的 route 信息
-  （Principal 已通过 ctx 注入，route 信息未注入）。
+**修订结论**：框架传给 `beforeTool` 的 ctx 是**原 ctx 对象**，任意自定义 key 原样透传
+（探针用一个 chat 包私有 key 读到了注入值）。故 `resource` 在 **v1 即可有值**，不必等到 v2。
 
-**两种填法，本设计选后者**：
+**资源值的两个来源**：
 
-1. **从 `Arguments` 解析**（如 `fs_write` 的 path 参数）——精确，但需要每个工具的
-   参数 schema 知识，v1 成本高；
-2. **从 ctx 注入的 WorkspaceID 取**——v1 只需在 `pipeline.go:225` 附近
-   多注入一个 `WithResource(ctx, p.route.WorkspaceID)`，消费方零解析。
+1. **工作区 ID**（推荐 v1 采用）——IM 渠道的 resource 天然是当前工作区
+   （`pipeline.go:226` 的 `p.route.WorkspaceID` 已有）；只需在 `pipeline.go:225` 附近
+   多注入一行 `WithResource(ctx, p.route.WorkspaceID)`，消费方零解析。
+2. **工具参数解析**（v2 精确化）——从 `BeforeToolArgs.Arguments`（`callbacks.go:66`）
+   解析具体资源（如 `fs_write` 的 path 参数），精确到"哪个文件"，但需每个工具的
+   schema 知识。
 
-> **v1 实现建议**：`resource` 先恒为空，接口预留字段；v2 再通过
-> `WithResource` 注入工作区 ID。这样 v1 不引入解析复杂度，v2 无需改接口。
+> **v1 实现建议**：采用来源 1——`WithResource` 注入工作区 ID，成本仅一行。
+> v2 再叠加来源 2 做参数级细分。**接口无需二次改动**（这正是决策二"现在扩"的兑现）。
 
 ### 3.4 改动清单（爆炸半径）
 
@@ -332,8 +334,11 @@ FR-10.8（`01-需求文档.md:536`）：「绑定后**按系统角色判定权�
 ### 缺口 1：`RequireWritable` 零生产消费方（**最重**）
 
 `grep` 全仓：`RequireWritable`（`context.go:62`）只在测试中出现，
-**无任何生产代码调用**。这意味着"IM 来源只读"目前是**声明而非执行**——
-现在安全是因为工具白名单默认拒绝了所有工具，不是上下文降权生效。
+**无任何生产代码调用**。这意味着"IM 来源只读"目前是**声明而非执行**。
+
+**已由运行时探针确证**（证据见 §10）：`ContextKind=channel` 的上下文中，
+工具**照常执行**（回答含工具返回值）——上下文级降权在 channel 下**零拦截**。
+现在安全只是因为工具白名单默认拒绝了所有工具，不是上下文降权生效。
 
 **与 RBAC 的关系**：RBAC 引入 `ws:modify` 等资源级权限点后，若③上下文级仍未接线，
 则「有 `ws:modify` 权限的 IM 用户」会绕过只读降权。**RBAC 会放大这个缺口**。
@@ -362,6 +367,8 @@ v1 引入 RBAC 时应**一并修正**——要么默认拒绝，要么启动期�
 
 - 新增 `AccessRequest` 结构（`permission.go`）；
 - 改 `PermissionSource.Allowed` 签名；
+- 新增 `WithResource`/`ResourceFrom`（`authz` 包），并在 `pipeline.go:225` 附近注入工作区 ID
+  （探针已证 ctx 原样透传，见 §10）；
 - 适配 `StaticPermissions`、`permission_plugin.go:71`、17 处测试调用点；
 - **验证**：`go build ./...` + `go test ./internal/authz/ ./internal/chat/`（全绿，行为不变）。
 
@@ -378,11 +385,14 @@ v1 引入 RBAC 时应**一并修正**——要么默认拒绝，要么启动期�
 - 用户级默认改 fail-closed（或启动期强制校验）；
 - **验证**：端到端测试——IM 用户即使有角色，写操作仍被拒。
 
-### Wave 4：资源级（v2，决策二的兑现）
+### Wave 4：资源级细化（v2）
 
-- `WithResource` 注入工作区 ID；
-- `ws:modify` 等资源级权限点启用；
-- **验证**：跨工作区访问被拒。
+> **定位修订**：工作区 ID 的注入（`WithResource`）已证明 v1 可行，**并入 Wave 1**（成本一行）。
+> 本波只做「参数级细分」——从工具参数解析具体资源。
+
+- 从 `BeforeToolArgs.Arguments`（`callbacks.go:66`）解析具体资源（如 `fs_write` 的 path）；
+- `ws:modify` 等资源级权限点启用细粒度判定；
+- **验证**：跨工作区 / 跨路径访问被拒。
 
 ---
 
@@ -396,6 +406,46 @@ v1 引入 RBAC 时应**一并修正**——要么默认拒绝，要么启动期�
 | AC-4 | 通配匹配与现有语义一致 | 单测：复用 `matchToolPattern` 的用例 |
 | AC-5 | 拒绝日志含完整链路 | 单测：断言日志含 user→role→permission |
 | AC-6 | owner 判定不受影响 | 回归：既有 `gate_test.go` / `principal_test.go` 全绿 |
+
+---
+
+## 10. 运行时探针证据
+
+本设计的两个关键假设经一次性探针（`internal/chat/zz_ctxprobe_test.go`，跑完即删）
+在真实框架链路上验证。命令：
+
+```
+go test ./internal/chat/ -run TestProbe_CtxPassthroughAndChannelGap -v
+```
+
+输出：
+
+```
+PROBE-RESULT called=true resource="ws-probe-123" kind="channel" hasPrincipal=true
+PROBE-ANSWER "工具返回：[{\"type\":\"text\",\"text\":\"Echo: 你好\"}]"
+--- PASS (5.62s)
+```
+
+### 证据 1：ctx 自定义值原样透传（**推翻原稿断言**）
+
+探针用一个 **chat 包私有 key**（`probeCtxKey{}`）注入 `"ws-probe-123"`。
+框架不可能认识这个私有 key——但 `beforeTool` 侧的 `PermissionSource` 读到了它
+（`resource="ws-probe-123"`）。
+
+**结论**：框架传给 `beforeTool` 的 ctx 是**原 ctx 对象**，非重建。
+→ `WithResource(ctx, workspaceID)` 方案**可行**，`resource` 在 v1 即可有值（§3.3 已据此修订）。
+
+### 证据 2：上下文级降权零拦截（**确证缺口 1**）
+
+探针在 `KindChannel` 上下文中放行工具，工具**照常执行**
+（`PROBE-ANSWER` 含 `Echo: 你好`，即 mockmcp 的真实返回值）。
+
+**结论**：`ContextKind=channel` 虽正确透传（`kind="channel"`），但**无任何代码读取它来拦截**。
+→ 缺口 1 从"静态推断"升级为"运行时事实"：IM 来源的写操作**当前不受上下文级保护**。
+
+> **探针的边界（诚实标注）**：本探针用 `PermissionSource` 读 ctx，与真实
+> `PrincipalPolicyPlugin` 的 ctx 消费点同源（都是 `beforeTool` 回调），故结论可迁移。
+> 但**未覆盖**多轮工具调用、并发场景下的 ctx 一致性——如需可在实现期补。
 
 ---
 
