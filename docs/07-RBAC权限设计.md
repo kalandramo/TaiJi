@@ -362,13 +362,33 @@ mockmcp 的 `echo` 声明 `readOnlyHint=true` 后读到 `readOnly=true`。
 将来做这两条路径时，需在对应入口注入 kind——否则 `ContextGuardPlugin`
 会把它们的写操作 fail-closed 拒绝（这是**正确**的行为，但要记得注入可写 kind）。
 
-### 缺口 3：用户级权限默认 fail-open
+### 缺口 3：用户级权限默认 fail-open —— **已修复**（2026-09-26）
 
-- 部署级：`AllowTools` 空 = 全部拒绝（fail-closed）。
-- 用户级：`Permissions` 为 nil = 不做判定（`execute.go:236` 只在非 nil 时挂插件）。
+**原缺口**：部署级 `AllowTools` 空 = 全部拒绝（fail-closed），但用户级
+`Permissions` 为 nil = 不做判定——**忘记配 RBAC 表 → 所有过门禁的用户能用所有已放行工具**。
 
-即：**忘记配 RBAC 表 → 所有过门禁的用户能用所有已放行工具**。
-v1 引入 RBAC 时应**一并修正**——要么默认拒绝，要么启动期强制要求配置。
+**修复**：新增 `cmd/taiji/serve_permissions.go` 的 `validateServePermissions`，
+在 `buildPipeline`（serve 专用装配点）做**启动期 fail-fast**：有工具实际可调用
+但无用户级权限决策时，**拒绝启动**，并提示两条出路（配表 / 显式放开）。
+
+**为什么不运行期静默拒绝**：这是**配置错误**而非运行时状态。启动期大声失败
+优于运行期静默放行——静默失效最难排查（issue #9 教训）。与 `gateConfigFromEnv`
+的取向一致（「宁可拒绝也不能静默放行」）。
+
+**判据**：`HasTools` 取「有工具**实际可调用**」（`len(allowTools) > 0`），
+而非「挂了 MCP server」——白名单为空时工具策略默认拒绝一切，无边界可失。
+
+**探针发现的镜像缺陷（一并修复）**：CLI 不注入 Principal，但 `runChat` 原也传
+`Permissions: envPermissions()`——用户一设该变量，`PrincipalPolicyPlugin` 就对
+所有工具调用返回「无法确认你的身份」，**CLI 功能整体失效**（探针实测确认）。
+修复：CLI 不再传 `Permissions`（用户级权限按 IM 主体判定，CLI 无 IM 身份），
+配了则显式提示。
+
+**验证证据**：
+- 单测 `cmd/taiji/serve_permissions_test.go`：5 例（有工具无表→错 / 无工具→放 / 有表→放 / 显式放开→放 / 两者都设→放）；
+- 接线断言：`buildPipeline` 确实调用校验（剥离注释后断言，反证有效）；
+- CLI 回归护栏 `cmd/taiji/chat_permissions_test.go`：`runChat` 不得传 `Permissions`；
+- **反证验证**：把校验改 no-op → 单测变红；移除调用 → 接线断言变红（两者均实测）。
 
 ---
 
@@ -390,13 +410,10 @@ v1 引入 RBAC 时应**一并修正**——要么默认拒绝，要么启动期�
 - 装配：`cmd/taiji/main.go:679` 换 `envRBAC()`；
 - **验证**：单元测试覆盖「角色继承 / 通配 / 未绑定用户拒绝 / 空表拒绝」。
 
-### Wave 3：接线补缺（缺口 3）—— 缺口 1 已于本次完成
+### Wave 3：接线补缺 —— **缺口 1、3 均已完成**
 
-> **缺口 1 已完成**（`ContextGuardPlugin`，见 §7）：`RequireWritable` 已接执行点。
-> 本波仅剩缺口 3。
-
-- 用户级默认改 fail-closed（或启动期强制校验）；
-- **验证**：端到端测试——IM 用户即使有角色，写操作仍被拒。
+> 缺口 1（上下文级降权接线）与缺口 3（用户级 fail-open）已于 2026-09-26 完成，
+> 见 §7。本波无剩余项。
 
 ### Wave 4：资源级细化（v2）
 
@@ -482,6 +499,8 @@ PROBE-ANSWER "工具返回：[{\"type\":\"text\",\"text\":\"Echo: 你好\"}]"
 | `internal/authz/principal.go:129` | `IsOwner` |
 | `internal/authz/context.go:62` | `RequireWritable`（已有执行点：`ContextGuardPlugin`） |
 | `internal/authz/context_guard.go` | `ContextGuardPlugin`（上下文级降权的执行点，2026-09-26 新增） |
+| `cmd/taiji/serve_permissions.go` | `validateServePermissions`（serve 权限配置 fail-fast，2026-09-26 新增） |
+| `cmd/taiji/main.go` `buildPipeline` | serve 装配点（校验调用处） |
 | `internal/chat/chat.go:49` | `Options.Permissions` |
 | `internal/chat/execute.go:236` | 插件挂载点 |
 | `internal/server/pipeline.go:190` | `WithContextKind` 注入 |

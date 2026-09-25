@@ -148,15 +148,30 @@ func runChat(args []string) int {
 	ctx, cancel := signalContext()
 	defer cancel()
 
+	// CLI 不挂用户级权限插件（issue #6 缺口 3 的镜像修复）。
+	//
+	// 理由：用户级权限按 IM 主体（open_id）判定，而 CLI 是本地单用户、
+	// 无 IM 身份——PrincipalPolicyPlugin 对「无 Principal」拒绝，挂上它
+	// 会让 CLI 的所有工具调用被拒（实测确认的静默失效）。
+	// Options.Permissions 的注释本就写明 CLI 属「nil」场景。
+	//
+	// 若用户设了该变量（误以为对 CLI 生效），显式提示而非静默忽略——
+	// 否则「配了却不生效」又是一个静默缺口。
+	if envPermissions() != nil {
+		fmt.Fprintf(os.Stderr,
+			"taiji chat: 注意——TAIJI_USER_PERMISSIONS 对 CLI 无效"+
+				"（用户级权限按 IM 主体判定，CLI 无 IM 身份）。该变量仅 serve 生效。\n")
+	}
+
 	err = chat.Run(ctx, os.Stdin, chat.Options{
 		Config:      modelCfg,
 		Instruction: *instruction,
 		ToolSets:    toolSets,
 		AllowTools:  append(envAllowTools(), allowTools...),
-		Permissions: envPermissions(),
-		Out:         os.Stdout,
-		Echo:        os.Stderr,
-		Debug:       *debug,
+		// Permissions 刻意不传：CLI 无 IM 身份，用户级权限不适用。
+		Out:   os.Stdout,
+		Echo:  os.Stderr,
+		Debug: *debug,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "taiji chat: %v\n", err)
@@ -399,11 +414,8 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	}
 
 	// 出站：需要应用凭据换 tenant_access_token。
-	sender, err := feishu.NewSender(feishu.SenderConfigFromEnv(loaded))
-	if err != nil {
-		bootstrap.CloseMCPSets(toolSets)
-		return nil, err
-	}
+	// （构造移到权限校验之后——校验是纯配置检查，不需要凭据，
+	// 应优先暴露配置错误，且让校验可在无凭据环境下测试。）
 
 	// 执行器：长驻，跨消息共享 session（多轮历史的前提）。
 	//
@@ -426,7 +438,12 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 		}
 	}
 
-	// 用户级权限（方案 A：静态配置）。未配置时为 nil —— 不做用户级判定。
+	// 用户级权限（方案 A：静态配置）。未配置时为 nil。
+	//
+	// **serve 路径必须有明确的用户级权限决策**（issue #6 缺口 3）：
+	// 与 CLI 不同，serve 面向多个 IM 用户，缺权限表 = 任何能触发 bot 的人
+	// 都能用所有已放行工具（安全边界消失）。故此处 fail-fast——
+	// 有工具但无决策时拒绝启动，而非运行期静默放行。
 	permissions := envPermissions()
 	if permissions != nil {
 		if sp, ok := permissions.(*authz.StaticPermissions); ok {
@@ -440,9 +457,28 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 		logf("主体 ID 前缀：%s:feishu: —— TAIJI_USER_PERMISSIONS 的 key "+
 			"应写成 <该前缀><用户open_id>，如 %s:feishu:ou_xxx=工具名",
 			workspaceID(loaded), workspaceID(loaded))
-	} else if len(toolSets) > 0 {
-		logf("提示：未配置 TAIJI_USER_PERMISSIONS —— 任何能触发 bot 的用户" +
-			"都可使用已放行的工具。若需按用户管控，请配置该变量。")
+	} else if allowAllUsersFromEnv() {
+		logf("用户级权限：已按 %s=1 显式放开——任何能触发 bot 的用户"+
+			"都可使用已放行的工具。", envAllowAllUsers)
+	}
+	if err := validateServePermissions(servePermInput{
+		// 判据是「有工具**实际可调用**」，而非「挂了 MCP server」——
+		// 白名单为空时工具策略默认拒绝一切，无边界可失，
+		// 此时要求权限表是误导（用户配了表重启后才发现白名单才是问题）。
+		HasTools:       len(allowTools) > 0,
+		HasPermissions: permissions != nil,
+		AllowAllUsers:  allowAllUsersFromEnv(),
+	}); err != nil {
+		bootstrap.CloseMCPSets(toolSets)
+		return nil, err
+	}
+
+	// 出站：需要应用凭据换 tenant_access_token。
+	// 放在权限校验之后——校验是纯配置检查，先暴露配置错误更省事。
+	sender, err := feishu.NewSender(feishu.SenderConfigFromEnv(loaded))
+	if err != nil {
+		bootstrap.CloseMCPSets(toolSets)
+		return nil, err
 	}
 
 	executor, err := chat.NewExecutor(chat.Options{
