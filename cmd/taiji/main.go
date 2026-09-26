@@ -581,11 +581,19 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	}
 
 	logf("命令系统已装配：%v", cmdRegistry.Names())
-	if permissions != nil {
-		logf("命令权限点形如 cmd:help、cmd:stop——" +
-			"在 TAIJI_RBAC 的 role 权限列表里加上它们即可放行")
+
+	// 命令权限提示。
+	//
+	// **为什么不能只说「未配权限源」**：用户可能配了 TAIJI_USER_PERMISSIONS
+	// （工具权限），它**不含 cmd: 权限点**——命令仍会被全部拒绝，但
+	// 用户看到「已启用」会以为没问题。故提示必须点明「需要 cmd: 权限点」。
+	if permissions == nil {
+		logf("警告：未配用户级权限源，命令将全部被拒（fail-closed）。" +
+			"配 TAIJI_RBAC 并在 role 权限列表里加上 cmd:help、cmd:stop 等即可放行")
 	} else {
-		logf("警告：未配用户级权限源，命令将全部被拒（fail-closed）")
+		logf("命令权限点形如 cmd:help、cmd:status、cmd:clear、cmd:stop——" +
+			"须在 TAIJI_RBAC 的 role 权限列表里**显式**列出；" +
+			"TAIJI_USER_PERMISSIONS（工具权限）不含它们")
 	}
 	return &pipelineHolder{Pipeline: p, executor: executor}, nil
 }
