@@ -54,11 +54,15 @@ type Command struct {
 	// owner 是「资源属于谁」，RBAC 是「主体能做什么」。两者都要过。
 	// 本包只**声明**该属性，判定由调用方做（它才知道谁是 owner）。
 	OwnerOnly bool
-	// Handler 执行命令。args 是命令名之后的剩余文本（已 TrimSpace）。
+	// Handler 执行命令。
 	//
 	// 返回的 string 是给用户的回复文本；error 表示执行失败。
 	// Handler **不负责出站**——由调用方统一投递（便于测试与审计）。
-	Handler func(args string) (string, error)
+	//
+	// 参数是 Request（含 Args/SessionID 等上下文）而非裸 args 字符串：
+	// /status 需要会话信息、/clear 与 /stop 需要 sessionID——
+	// 裸字符串无法承载这些。见 builtins.go 的 Request 定义。
+	Handler func(req Request) (string, error)
 }
 
 // Registry 是命令注册表（SPEC §3.2）。

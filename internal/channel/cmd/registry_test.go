@@ -11,7 +11,7 @@ func TestRegistry_RegisterAndLookup(t *testing.T) {
 	r := NewRegistry()
 	err := r.Register(Command{
 		Name: "help", Usage: "/help", Desc: "显示帮助",
-		Handler: func(string) (string, error) { return "ok", nil },
+		Handler: func(Request) (string, error) { return "ok", nil },
 	})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
@@ -45,7 +45,7 @@ func TestRegistry_RejectsInvalidNames(t *testing.T) {
 	for _, c := range cases {
 		r := NewRegistry()
 		err := r.Register(Command{
-			Name: c.name, Handler: func(string) (string, error) { return "", nil },
+			Name: c.name, Handler: func(Request) (string, error) { return "", nil },
 		})
 		if err == nil {
 			t.Errorf("Register(%q) 应失败（%s）", c.name, c.why)
@@ -57,7 +57,7 @@ func TestRegistry_RejectsInvalidNames(t *testing.T) {
 
 func TestRegistry_RejectsDuplicate(t *testing.T) {
 	r := NewRegistry()
-	h := func(string) (string, error) { return "", nil }
+	h := func(Request) (string, error) { return "", nil }
 	if err := r.Register(Command{Name: "help", Handler: h}); err != nil {
 		t.Fatalf("首次注册应成功: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestRegistry_MustRegisterPanics(t *testing.T) {
 
 func TestHelpText_ListsAllRegistered(t *testing.T) {
 	r := NewRegistry()
-	h := func(string) (string, error) { return "", nil }
+	h := func(Request) (string, error) { return "", nil }
 	for _, n := range []string{"help", "status", "clear", "stop"} {
 		r.MustRegister(Command{Name: n, Usage: "/" + n, Desc: n + " 说明", Handler: h})
 	}
@@ -111,7 +111,7 @@ func TestHelpText_ListsAllRegistered(t *testing.T) {
 // 见 SPEC §9.4 的反证设计。
 func TestHelpText_DynamicFromRegistry(t *testing.T) {
 	r := NewRegistry()
-	h := func(string) (string, error) { return "", nil }
+	h := func(Request) (string, error) { return "", nil }
 
 	r.MustRegister(Command{Name: "help", Usage: "/help", Desc: "帮助", Handler: h})
 	before := r.HelpText()
@@ -131,7 +131,7 @@ func TestHelpText_DynamicFromRegistry(t *testing.T) {
 
 func TestHelpText_MarksOwnerOnly(t *testing.T) {
 	r := NewRegistry()
-	h := func(string) (string, error) { return "", nil }
+	h := func(Request) (string, error) { return "", nil }
 	r.MustRegister(Command{Name: "clear", Usage: "/clear", Desc: "清空", OwnerOnly: true, Handler: h})
 
 	help := r.HelpText()
@@ -152,7 +152,7 @@ func TestHelpText_EmptyRegistry(t *testing.T) {
 func newTestRegistry(t *testing.T) *Registry {
 	t.Helper()
 	r := NewRegistry()
-	h := func(string) (string, error) { return "", nil }
+	h := func(Request) (string, error) { return "", nil }
 	r.MustRegister(Command{Name: "help", Usage: "/help", Handler: h})
 	r.MustRegister(Command{Name: "status", Usage: "/status", Handler: h})
 	return r
@@ -225,7 +225,7 @@ func TestParse_TooLongSkipsCommandDetection(t *testing.T) {
 
 func TestParse_NamesIsStable(t *testing.T) {
 	r := NewRegistry()
-	h := func(string) (string, error) { return "", nil }
+	h := func(Request) (string, error) { return "", nil }
 	for _, n := range []string{"zebra", "alpha", "mid"} {
 		r.MustRegister(Command{Name: n, Handler: h})
 	}
