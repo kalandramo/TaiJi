@@ -1,16 +1,23 @@
-// Package authz 的用户级权限（方案 A：静态配置）。
+// Package authz 的用户级权限。
 //
 // 与 toolpolicy.go 的分工——两者是**串联的两个维度**，不是替代关系：
 //
 //	维度        插件              判定依据              变更频率
 //	部署级      approval（既有）   启动期白名单          低（改配置重启）
-//	用户级      PrincipalPolicy    本文件的权限表        高（可热更新）
+//	用户级      PrincipalPolicy    权限源（RBAC）        高（可热更新）
 //
 // 执行顺序：先过部署白名单（工具是否在本部署启用），
 // 再过用户权限（该用户能否用这个工具）。任一拒绝即不执行。
 //
 // 为什么分开：混在一起会让"改部署配置"和"改用户权限"互相干扰；
 // 且 approval 是上游 SDK 实现，改它意味着 fork。
+//
+// 本文件的 StaticPermissions 是 PermissionSource 的**最小实现**
+// （User 直连 Permission，无角色、无继承）。生产配置入口已于
+// 2026-09-26 退役——TAIJI_USER_PERMISSIONS 被 TAIJI_RBAC 取代，
+// resolvePermissions 只返回 RBAC。此类型保留供测试作轻量夹具使用
+// （避免为验证一个匹配规则而搭出完整的角色/继承配置）。
+// matchToolPattern 由 RBAC 复用，是两者的共同匹配语义。
 package authz
 
 import (

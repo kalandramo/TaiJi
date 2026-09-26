@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
 	"github.com/kalandramo/TaiJi/internal/config"
 )
@@ -403,72 +401,65 @@ func TestRunChat_ReadsAllowToolsFromEnv(t *testing.T) {
 	}
 }
 
-// ===== 6. 用户级权限表解析（方案 A）=====
+// ===== 6. TAIJI_USER_PERMISSIONS 退役（2026-09-26）=====
+//
+// 该变量曾提供用户级权限（静态表），已被 TAIJI_RBAC 取代。
+// 退役理由：静态表是 RBAC 的退化情形（User 直连 Permission，无角色、
+// 无继承），两者并存引入"优先级排他"规则——在 A 里配的权限被 B
+// 静默覆盖，正是项目最忌讳的静默失效。
 
-func TestEnvPermissions_AbsentIsNil(t *testing.T) {
+// 退役后 envPermissions 不应再存在（配置通道已删）。
+//
+// 源码级断言：防止"退役不彻底"——留着函数但没人调用，会让下一个
+// 读代码的人以为它仍可用。
+func TestUserPermissions_EnvParserRemoved(t *testing.T) {
+	data, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("读取 main.go: %v", err)
+	}
+	if contains(string(data), "func envPermissions(") {
+		t.Error("envPermissions 应已删除——TAIJI_USER_PERMISSIONS 已退役，" +
+			"留着解析函数会让读者以为它仍生效")
+	}
+}
+
+// 设了退役变量时，必须给出告警（不能静默忽略）。
+//
+// 为什么重要：老部署升级后若只设 TAIJI_USER_PERMISSIONS，
+// 用户级权限会整体消失——没告警就无从察觉，属于静默失效。
+func TestUserPermissions_RetiredWarning(t *testing.T) {
+	t.Setenv("TAIJI_USER_PERMISSIONS", "ws1:feishu:ou_alice=mockmcp_echo")
+	w := retiredUserPermissionsWarning()
+	if w == "" {
+		t.Fatal("设了退役变量应给出告警（否则静默失效）")
+	}
+	for _, want := range []string{"TAIJI_USER_PERMISSIONS", "退役", "TAIJI_RBAC"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("告警应包含 %q，实际：%s", want, w)
+		}
+	}
+}
+
+// 未设退役变量时不应有告警（避免噪声）。
+func TestUserPermissions_NoWarningWhenUnset(t *testing.T) {
 	t.Setenv("TAIJI_USER_PERMISSIONS", "")
-	if got := envPermissions(); got != nil {
-		t.Errorf("未配置时应返回 nil（不做用户级判定），got %v", got)
+	if w := retiredUserPermissionsWarning(); w != "" {
+		t.Errorf("未设退役变量不应告警，实际：%s", w)
 	}
 }
 
-func TestEnvPermissions_ParsesEntries(t *testing.T) {
-	t.Setenv("TAIJI_USER_PERMISSIONS",
-		"ws1:feishu:ou_alice=mockmcp_echo,infraverse_*;ws1:feishu:ou_admin=*")
+// 退役变量的值**不再影响**权限判定——只设它（不设 RBAC）时无权限源。
+//
+// 这是退役的核心语义：从"旧变量仍生效"到"旧变量完全失效"。
+func TestUserPermissions_ValueIgnored(t *testing.T) {
+	t.Setenv("TAIJI_RBAC", "")
+	t.Setenv("TAIJI_USER_PERMISSIONS", "ws1:feishu:ou_alice=mockmcp_echo")
 
-	src := envPermissions()
-	if src == nil {
-		t.Fatal("应返回权限源")
+	src, err := resolvePermissions()
+	if err != nil {
+		t.Fatalf("resolvePermissions: %v", err)
 	}
-
-	ctx := context.Background()
-	cases := []struct {
-		principal string
-		tool      string
-		want      bool
-	}{
-		{"ws1:feishu:ou_alice", "mockmcp_echo", true},
-		{"ws1:feishu:ou_alice", "infraverse_dce_ip", true},
-		{"ws1:feishu:ou_alice", "other_tool", false},
-		{"ws1:feishu:ou_admin", "anything", true},
-		{"ws1:feishu:ou_unknown", "mockmcp_echo", false},
-	}
-	for _, c := range cases {
-		got, err := src.Allowed(ctx, authz.AccessRequest{Principal: authz.Principal{Type: "im_user", ID: c.principal}, Action: c.tool})
-		if err != nil {
-			t.Fatalf("Allowed(%s,%s): %v", c.principal, c.tool, err)
-		}
-		if got != c.want {
-			t.Errorf("Allowed(%s, %s) = %v, want %v", c.principal, c.tool, got, c.want)
-		}
-	}
-}
-
-func TestEnvPermissions_SkipsMalformedEntries(t *testing.T) {
-	// 无 = 的条目跳过，不影响合法条目（一处笔误不导致启动失败）
-	t.Setenv("TAIJI_USER_PERMISSIONS", "garbage;ws1:feishu:ou_alice=mockmcp_echo")
-	src := envPermissions()
-	if src == nil {
-		t.Fatal("合法条目应被解析")
-	}
-	ok, _ := src.Allowed(context.Background(),
-		authz.AccessRequest{Principal: authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, Action: "mockmcp_echo"})
-	if !ok {
-		t.Error("合法条目应生效")
-	}
-}
-
-func TestEnvPermissions_WhitespaceTolerated(t *testing.T) {
-	t.Setenv("TAIJI_USER_PERMISSIONS", "  ws1:feishu:ou_alice = mockmcp_echo , mockmcp_other  ")
-	src := envPermissions()
-	ok, _ := src.Allowed(context.Background(),
-		authz.AccessRequest{Principal: authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, Action: "mockmcp_echo"})
-	if !ok {
-		t.Error("应容忍空白")
-	}
-	ok2, _ := src.Allowed(context.Background(),
-		authz.AccessRequest{Principal: authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, Action: "mockmcp_other"})
-	if !ok2 {
-		t.Error("第二个工具也应生效")
+	if src != nil {
+		t.Errorf("只设退役变量应返回 nil（其值不再生效），got %T", src)
 	}
 }

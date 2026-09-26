@@ -444,7 +444,7 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 		}
 	}
 
-	// 用户级权限（方案 A：静态配置）。未配置时为 nil。
+	// 用户级权限（唯一来源：TAIJI_RBAC）。未配置时为 nil。
 	//
 	// **serve 路径必须有明确的用户级权限决策**（issue #6 缺口 3）：
 	// 与 CLI 不同，serve 面向多个 IM 用户，缺权限表 = 任何能触发 bot 的人
@@ -453,6 +453,11 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	//
 	// RBAC 配置有误（引用未定义角色）时 resolvePermissions 返回 error，
 	// 同样 fail-fast——否则该用户会被静默拒绝（「配了却不生效」）。
+	//
+	// 老变量 TAIJI_USER_PERMISSIONS 已退役，此处仅告警（不读值）。
+	if w := retiredUserPermissionsWarning(); w != "" {
+		logf("%s", w)
+	}
 	permissions, err := resolvePermissions()
 	if err != nil {
 		bootstrap.CloseMCPSets(toolSets)
@@ -464,12 +469,14 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 			logf("用户级权限已启用：RBAC（%d 个角色 / %d 个用户）",
 				sp.RoleCount(), sp.UserCount())
 		case *authz.StaticPermissions:
+			// 生产路径不应到达：resolvePermissions 只返回 RBAC。
+			// 保留分支是为库内其他 PermissionSource 实现留出日志位置。
 			logf("用户级权限已启用：静态表（%d 个主体）", sp.PrincipalCount())
 		default:
 			logf("用户级权限已启用")
 		}
-		// 打印主体 ID 前缀——否则用户不知道 TAIJI_USER_PERMISSIONS 的
-		// key 该写什么（workspace 段有兜底值 default，不显眼且易漏）。
+		// 打印主体 ID 前缀——否则用户不知道 TAIJI_RBAC 的
+		// user: 条目该写什么（workspace 段有兜底值 default，不显眼且易漏）。
 		// 格式与 pipeline 注入时用的完全一致（同一 workspaceID()）。
 		logf("主体 ID 前缀：%s:feishu: —— 配置的 key "+
 			"应写成 <该前缀><用户open_id>，如 %s:feishu:ou_xxx",
@@ -761,47 +768,33 @@ func registeredToolNamesHint(cfgs []bootstrap.MCPServerConfig) []string {
 	return serverNames(cfgs)
 }
 
-// envPermissions 从环境读用户级权限表（方案 A：静态配置）。
+// envUserPermissionsRetired 是已退役的用户级权限表环境变量名。
 //
-// 格式：条目用分号分隔，主体与工具列表用等号分隔，工具用逗号分隔。
+// 保留这个常量只为**检测用户还在用它**并给出迁移提示——其值不再被读取。
+// 退役日期：2026-09-26，由 TAIJI_RBAC 取代。
+const envUserPermissionsRetired = "TAIJI_USER_PERMISSIONS"
+
+// retiredUserPermissionsWarning 返回已退役配置的迁移提示（无则空串）。
 //
-//	TAIJI_USER_PERMISSIONS="ws1:feishu:ou_alice=mockmcp_echo,infraverse_*;ws1:feishu:ou_admin=*"
+// 设计为纯函数（返回文本而非直接打印）：调用方的 logf 是 buildPipeline
+// 内的局部闭包，包级函数够不到；且纯函数便于测试。
 //
-// 主体 ID 形态为 {workspace}:{platform}:{open_id}（见 authz.ResolvePrincipal），
-// 与管道注入的形态一致。工具名支持 "*" 与 "prefix_*" 通配。
+// 为什么必须提示而不能静默忽略：TAIJI_USER_PERMISSIONS 退役后，
+// 老部署升级会遇到两种结果，且都难与「配置写错」区分——
+//   - 没配 RBAC → 用户级权限整体消失 → serve 拒绝启动（有工具时）；
+//   - 配了 ALLOW_ALL_USERS=1 → 变成任何人可用所有工具。
 //
-// 返回 nil 表示未配置——此时不做用户级判定（向后兼容）。
-// 配置了但解析出空表 → 返回空表（拒绝一切），与"未配置"语义不同。
-func envPermissions() authz.PermissionSource {
-	raw := strings.TrimSpace(os.Getenv("TAIJI_USER_PERMISSIONS"))
-	if raw == "" {
-		return nil
+// 显式警告把「静默失效」转为「有声失效」。这是项目取向的延续
+// （见 issue #9 教训：静默失效最难排查）。
+func retiredUserPermissionsWarning() string {
+	if strings.TrimSpace(os.Getenv(envUserPermissionsRetired)) == "" {
+		return ""
 	}
-	table := make(map[string][]string)
-	for _, entry := range strings.Split(raw, ";") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		principal, tools, ok := strings.Cut(entry, "=")
-		if !ok {
-			continue // 无 = 的条目跳过（不因一处笔误导致启动失败）
-		}
-		principal = strings.TrimSpace(principal)
-		if principal == "" {
-			continue
-		}
-		var list []string
-		for _, t := range strings.Split(tools, ",") {
-			if t = strings.TrimSpace(t); t != "" {
-				list = append(list, t)
-			}
-		}
-		if len(list) > 0 {
-			table[principal] = list
-		}
-	}
-	return authz.NewStaticPermissions(table)
+	return fmt.Sprintf(
+		"警告：%s 已退役（被 TAIJI_RBAC 取代），其值**不再生效**。"+
+			"请改用 TAIJI_RBAC，例如："+
+			"role:operator=<工具名1>,<工具名2>;user:<主体ID>=operator",
+		envUserPermissionsRetired)
 }
 
 // defaultMaxToolIterations 是工具调用轮次上限的默认值。
@@ -920,20 +913,19 @@ func splitCSV(v string) []string {
 
 // resolvePermissions 返回生效的用户级权限源。
 //
-// 优先级：TAIJI_RBAC（RBAC）> TAIJI_USER_PERMISSIONS（静态表）。
-// 两者都未配 → (nil, nil)（不做用户级判定；serve 路径会因此拒绝启动，
-// 见 validateServePermissions）。
+// 唯一来源是 TAIJI_RBAC。两者都未配 → (nil, nil)（不做用户级判定；
+// serve 路径会因此拒绝启动，见 validateServePermissions）。
 //
 // RBAC 配置有误时返回 error——调用方应 fail-fast。
 //
-// 为什么并存而非替换：这是迁移期——现有部署可能已在用
-// TAIJI_USER_PERMISSIONS，直接替换会让它们静默失效（项目取向：
-// 静默失效最难排查）。RBAC 是更完整的模型，新部署应优先用它。
+// **TAIJI_USER_PERMISSIONS 已退役**（2026-09-26）：其静态表模型是
+// RBAC 的退化情形（User 直连 Permission，无角色、无继承），且两者
+// 并存引入了一条"优先级排他"规则——用户在 A 里配的权限被 B 静默
+// 覆盖，正是项目最忌讳的静默失效。保留 RBAC 一个入口后，
+// "配了却不生效"的整类问题消失。
+//
+// 退役后仍检测老变量并告警（warnRetiredUserPermissions），
+// 把静默失效转为有声失效。
 func resolvePermissions() (authz.PermissionSource, error) {
-	if p, err := envRBAC(); err != nil {
-		return nil, err
-	} else if p != nil {
-		return p, nil
-	}
-	return envPermissions(), nil
+	return envRBAC()
 }

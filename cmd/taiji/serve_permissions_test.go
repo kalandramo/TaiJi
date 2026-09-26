@@ -26,10 +26,15 @@ func TestValidateServePermissions_ToolsWithoutPolicyIsError(t *testing.T) {
 		t.Fatal("有工具但无权限决策应拒绝启动，实际放行（缺口 3）")
 	}
 	// 错误信息必须给出两条出路，否则用户不知如何修复。
-	for _, want := range []string{"TAIJI_USER_PERMISSIONS", "TAIJI_ALLOW_ALL_USERS"} {
+	// 2026-09-26 更新：TAIJI_USER_PERMISSIONS 退役，改指 TAIJI_RBAC。
+	for _, want := range []string{"TAIJI_RBAC", "TAIJI_ALLOW_ALL_USERS"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("错误信息应提示 %s，实际：%v", want, err)
 		}
+	}
+	// 不应再引导用户去用已退役的变量。
+	if strings.Contains(err.Error(), "TAIJI_USER_PERMISSIONS") {
+		t.Errorf("错误信息不应再提及已退役的 TAIJI_USER_PERMISSIONS，实际：%v", err)
 	}
 }
 

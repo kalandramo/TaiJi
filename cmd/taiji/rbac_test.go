@@ -81,8 +81,14 @@ func TestEnvRBAC_ParsesInheritance(t *testing.T) {
 	}
 }
 
-// resolvePermissions 优先级：RBAC > 静态表。
-func TestResolvePermissions_RBACTakesPrecedence(t *testing.T) {
+// resolvePermissions 的唯一来源是 RBAC。
+//
+// 2026-09-26 更新：TAIJI_USER_PERMISSIONS 退役后不再有回退路径。
+// 原 TestResolvePermissions_FallsBackToStatic 已删除——它断言的
+// 「未配 RBAC 时回退静态表」行为**正是被退役的**。
+
+// 两者都配时，仍用 RBAC（退役变量被忽略）。
+func TestResolvePermissions_IgnoresRetiredStatic(t *testing.T) {
 	t.Setenv("TAIJI_RBAC", "role:admin=*;user:u=admin")
 	t.Setenv("TAIJI_USER_PERMISSIONS", "ws1:feishu:ou_alice=mockmcp_echo")
 
@@ -91,11 +97,12 @@ func TestResolvePermissions_RBACTakesPrecedence(t *testing.T) {
 		t.Fatalf("resolvePermissions: %v", err)
 	}
 	if _, ok := src.(*authz.RBACPermissions); !ok {
-		t.Errorf("两者都配时应优先 RBAC，got %T", src)
+		t.Errorf("应返回 RBAC，got %T", src)
 	}
 }
 
-func TestResolvePermissions_FallsBackToStatic(t *testing.T) {
+// 只配退役变量时无权限源（其值不再生效）。
+func TestResolvePermissions_RetiredStaticAloneIsNil(t *testing.T) {
 	t.Setenv("TAIJI_RBAC", "")
 	t.Setenv("TAIJI_USER_PERMISSIONS", "ws1:feishu:ou_alice=mockmcp_echo")
 
@@ -103,8 +110,8 @@ func TestResolvePermissions_FallsBackToStatic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolvePermissions: %v", err)
 	}
-	if _, ok := src.(*authz.StaticPermissions); !ok {
-		t.Errorf("未配 RBAC 时应回退静态表，got %T", src)
+	if src != nil {
+		t.Errorf("退役变量不应产生权限源，got %T", src)
 	}
 }
 

@@ -196,7 +196,8 @@ $ wc -l internal/authz/rbac.go
 | fail-closed | 未绑定用户拒绝 | `rbac.go:170` |
 
 **装配**：`TAIJI_RBAC` 环境变量（`role:` / `parent:` / `user:` 三类前缀），
-`resolvePermissions()` 统一入口，**RBAC 优先，未配时回退 `TAIJI_USER_PERMISSIONS`**。
+`resolvePermissions()` 统一入口，**唯一来源是 RBAC**
+（`TAIJI_USER_PERMISSIONS` 已于 2026-09-26 退役）。
 
 **测试**：`rbac_test.go` 13 例 + `rbac_validate_test.go` + `cmd/taiji/rbac_test.go` 6 例，
 含反证验证（禁用继承 → 继承测试变红）。

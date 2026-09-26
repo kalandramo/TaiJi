@@ -155,7 +155,7 @@ func TestAcceptance_ClearIsolatesHistory(t *testing.T) {
 // ── 验收 4：无权限时用户看到明确拒绝 ──
 
 func TestAcceptance_DeniedUserSeesClearMessage(t *testing.T) {
-	// 配一个**没有** cmd 权限的用户（模拟只配了 TAIJI_USER_PERMISSIONS 的场景）
+	// 配一个**没有** cmd 权限的用户（只有工具权限，无命令权限）
 	rbac := authz.NewRBACPermissions(authz.RBACConfig{
 		Roles:     map[string][]string{"viewer": {"mockmcp_echo"}}, // 只有工具权限
 		UserRoles: map[string][]string{"default:feishu:ou_sender": {"viewer"}},

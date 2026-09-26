@@ -278,7 +278,8 @@ FR-10.8（`01-需求文档.md:536`）要求「用户在 Web 端完成身份绑�
 
 ### 4.4 配置形态
 
-沿用 `TAIJI_USER_PERMISSIONS` 的**同源约定**（`cmd/taiji/main.go:679`）：
+沿用**单环境变量 + 分号分隔条目**的约定（原 `TAIJI_USER_PERMISSIONS` 的形态，
+该变量已于 2026-09-26 退役）：
 
 ```
 # v1：单环境变量，分号分隔条目
@@ -447,8 +448,15 @@ mockmcp 的 `echo` 声明 `readOnlyHint=true` 后读到 `readOnly=true`。
 
 **实现**：`internal/authz/rbac.go` 的 `RBACPermissions`（`User → Role → Permission`，
 含 RBAC1 角色继承 BFS 展开 + 环检测）。装配入口 `envRBAC()`（`TAIJI_RBAC` 环境变量），
-`resolvePermissions()` 统一入口——**RBAC 优先，未配时回退 `TAIJI_USER_PERMISSIONS`**
-（迁移期并存，避免现有部署静默失效）。
+`resolvePermissions()` 统一入口——**唯一来源是 RBAC**。
+
+> **后续更新**（2026-09-26）：`TAIJI_USER_PERMISSIONS` 已退役，
+> 「RBAC 优先，未配时回退静态表」的迁移期并存方案**已结束**。
+> 退役理由：静态表是 RBAC 的退化情形（User 直连 Permission，无角色、
+> 无继承），两者并存引入「优先级排他」规则——在 A 里配的权限被 B
+> 静默覆盖，正是项目最忌讳的静默失效。保留单一入口后该问题消失。
+> 老变量仍在启动时被检测并告警（`retiredUserPermissionsWarning`），
+> 把静默失效转为有声失效。
 
 **配置格式**（分号分隔条目，三类前缀）：
 ```

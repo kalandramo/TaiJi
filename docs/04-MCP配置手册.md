@@ -336,8 +336,8 @@ reg delete HKCU\Environment /F /V TAIJI_MCP_SERVERS
 | `TAIJI_FEISHU_ACTIVATION` | 触发模式（`always` / `disabled`） | 渠道 |
 | `TAIJI_FEISHU_AUDIENCE` | 受众（`owner_only` 等） | 渠道 |
 | `TAIJI_FEISHU_OWNERS` | owner 列表（逗号分隔） | 渠道 |
-| **`TAIJI_RBAC`** | **用户级权限（RBAC，推荐）** | **权限** |
-| **`TAIJI_USER_PERMISSIONS`** | **用户级权限（静态表，旧格式）** | **权限** |
+| **`TAIJI_RBAC`** | **用户级权限（RBAC，唯一入口）** | **权限** |
+| ~~`TAIJI_USER_PERMISSIONS`~~ | **已退役**（2026-09-26，改用 `TAIJI_RBAC`） | 权限 |
 | **`TAIJI_ALLOW_ALL_USERS`** | **显式声明放开用户级管控** | **权限** |
 | **`TAIJI_MAX_TOOL_ITERATIONS`** | **工具调用轮次上限（默认 8，`0` 关闭）** | **模型** |
 
@@ -358,32 +358,41 @@ reg delete HKCU\Environment /F /V TAIJI_MCP_SERVERS
 > `07-RBAC权限设计.md`（设计）与 `08-命令系统与RBAC需求文档.md`（需求）。
 > 但对**配置者**而言，「该设哪些环境变量」才是他要的答案。
 
-### 8.1 两个变量的关系：**二选一，不是合并**
+### 8.1 唯一入口：`TAIJI_RBAC`
 
-`TAIJI_RBAC` 与 `TAIJI_USER_PERMISSIONS` 都提供用户级权限，但**优先级是排他的**：
+用户级权限**只有一个配置入口**：`TAIJI_RBAC`。
 
 ```mermaid
 flowchart TD
     A["启动装配"] --> B{"TAIJI_RBAC 配了吗?"}
-    B -->|是| C["用 RBAC<br/>TAIJI_USER_PERMISSIONS 被**忽略**"]
-    B -->|否| D["用静态表<br/>TAIJI_USER_PERMISSIONS"]
-    C --> E["命令权限点 cmd:xxx 可用"]
-    D --> F["命令全部被拒<br/>（静态表无 cmd: 条目）"]
+    B -->|是| C["启用 RBAC 权限源"]
+    B -->|否| D{"TAIJI_ALLOW_ALL_USERS=1 ?"}
+    D -->|是| E["显式放开<br/>任何人可用所有工具"]
+    D -->|否| F["拒绝启动<br/>（有工具时）"]
 
     style C fill:#2d4a3a,stroke:#4a7,color:#fff
-    style D fill:#4a3a2d,stroke:#a74,color:#fff
+    style E fill:#4a3a2d,stroke:#a74,color:#fff
     style F fill:#4a2d2d,stroke:#a44,color:#fff
 ```
 
-代码依据：`cmd/taiji/main.go` 的 `resolvePermissions()`——RBAC 优先，
-未配才回退静态表。
+代码依据：`cmd/taiji/main.go` 的 `resolvePermissions()`——只返回 RBAC。
+
+**`TAIJI_USER_PERMISSIONS` 已退役**（2026-09-26）：其静态表模型是 RBAC 的
+退化情形（User 直连 Permission，无角色、无继承），且两者并存引入了一条
+「优先级排他」规则——在 A 里配的权限会被 B 静默覆盖，正是最忌讳的静默失效。
+保留单一入口后，这整类问题消失。
+
+> **升级注意**：若你的部署仍在用 `TAIJI_USER_PERMISSIONS`，它的值
+> **不再生效**。启动时会打印告警（不会静默忽略），但权限会消失——
+> 有工具时会拒绝启动，或（若设了 `TAIJI_ALLOW_ALL_USERS=1`）
+> 变成任何人可用所有工具。迁移见 §8.4。
 
 **实测证据**（2026-09-26，用真实二进制启动对比）：
 
 | 配置 | 启动日志 |
 |---|---|
-| 只配 `TAIJI_USER_PERMISSIONS` | `用户级权限已启用：静态表（1 个主体）` |
-| 两者都配 | `用户级权限已启用：RBAC（1 个角色 / 1 个用户）` |
+| 只配 `TAIJI_RBAC` | `用户级权限已启用：RBAC（1 个角色 / 1 个用户）` |
+| 只配 `TAIJI_USER_PERMISSIONS` | `警告：TAIJI_USER_PERMISSIONS 已退役…` + 拒绝启动 |
 
 ### 8.2 `TAIJI_RBAC` 语法
 
@@ -459,6 +468,34 @@ TAIJI_RBAC="role:viewer=cmd:help,cmd:status;role:operator=cmd:clear,cmd:stop,<�
 > | 有重复 | 仍放行 ← 继承失效被掩盖 |
 >
 > 所以「子角色只写自己独有的权限点」不只是风格偏好，而是**让继承可验证**的必要条件。
+
+**从旧格式迁移**（`TAIJI_USER_PERMISSIONS` → `TAIJI_RBAC`）
+
+旧格式是「用户直连工具」，没有角色概念：
+
+```
+# 旧（已退役，不再生效）
+TAIJI_USER_PERMISSIONS="default:feishu:ou_alice=tool_a,tool_b_*;default:feishu:ou_bob=*"
+```
+
+迁移成 RBAC：**先定义角色，再绑用户**。每个旧条目可以直译成一个角色：
+
+```
+# 新
+TAIJI_RBAC="role:alice=tool_a,tool_b_*;role:bob=*;user:default:feishu:ou_alice=alice;user:default:feishu:ou_bob=bob"
+```
+
+**若多人权限相同，迁移是净收益**——原来每人重复写一遍工具列表，
+现在共享一个角色，改权限只需改一处：
+
+```
+# 三人共享 operator 角色
+TAIJI_RBAC="role:operator=tool_a,tool_b_*;user:...ou_a=operator;user:...ou_b=operator;user:...ou_c=operator"
+```
+
+**迁移后务必验证**：旧配置里的工具权限**不会自动带入**，漏写即失效。
+启动日志会打印生效的 RBAC 规模（`N 个角色 / M 个用户`），
+对照你预期的数量即可发现遗漏。
 > 详见 §8.6 坑 5。
 
 > **前缀通配必须带下划线**：`Infraverse_*` 匹配 `Infraverse_infraverse_dce_ip`，
@@ -480,8 +517,10 @@ TAIJI_RBAC="role:viewer=cmd:help,cmd:status;role:operator=cmd:clear,cmd:stop,<�
 
 ### 8.6 五个容易踩的坑
 
-**坑 1：配了 RBAC 后 `TAIJI_USER_PERMISSIONS` 失效。**
-不是合并，是替换。若原来靠它放行工具，必须把工具权限也写进 RBAC 的 role 列表。
+**坑 1：`TAIJI_USER_PERMISSIONS` 已退役（2026-09-26），其值不再生效。**
+不是优先级低，是**完全被忽略**。若你的部署仍在用它，权限会消失：
+有工具时拒绝启动，或（设了 `TAIJI_ALLOW_ALL_USERS=1` 时）变成任何人可用所有工具。
+迁移方法见 §8.4 的「从旧格式迁移」。
 
 **坑 2：角色名拼错会导致启动失败**（这是设计，不是 bug）。
 `RBACConfig.Validate` 检查所有被引用的角色是否已定义，未定义则拒绝启动并列出全部错误：
