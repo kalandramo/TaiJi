@@ -439,11 +439,27 @@ TAIJI_RBAC="role:admin=*;user:default:feishu:ou_xxxxx=admin"
 **精细控制**（推荐，权限边界清晰）：
 
 ```
-TAIJI_RBAC="role:viewer=cmd:help,cmd:status;role:operator=cmd:help,cmd:status,cmd:clear,cmd:stop,<你的工具名前缀>_*;parent:operator=viewer;user:default:feishu:ou_xxxxx=operator"
+TAIJI_RBAC="role:viewer=cmd:help,cmd:status;role:operator=cmd:clear,cmd:stop,<你的工具名前缀>_*;parent:operator=viewer;user:default:feishu:ou_xxxxx=operator"
 ```
 
 把 `<你的工具名前缀>` 换成实际 server 名（如 `Infraverse`）。
 效果：`viewer` 只能看帮助与状态；`operator` 继承 viewer 并多出 `clear`/`stop`/工具权限。
+
+> **子角色不要重复父角色的权限点**——这是本示例的关键设计。
+>
+> 若写成 `role:operator=cmd:help,cmd:status,cmd:clear,...`（重复了 viewer 的
+> `cmd:help,cmd:status`），则**继承失效也无法被发现**：operator 自己写了这两条，
+> 即使 `parent:` 配置错误或继承逻辑有 bug，权限判定仍然通过。
+>
+> 实测对比（2026-09-26）：
+>
+> | 配置 | 去掉 `parent:` 后 `cmd:help` |
+> |---|---|
+> | **无重复**（推荐） | **拒绝** ← 证明放行确实来自继承 |
+> | 有重复 | 仍放行 ← 继承失效被掩盖 |
+>
+> 所以「子角色只写自己独有的权限点」不只是风格偏好，而是**让继承可验证**的必要条件。
+> 详见 §8.6 坑 5。
 
 > **前缀通配必须带下划线**：`Infraverse_*` 匹配 `Infraverse_infraverse_dce_ip`，
 > 但 `Infraverse`（无 `_*`）**不匹配**——它被当作精确名字。
@@ -462,7 +478,7 @@ TAIJI_RBAC="role:viewer=cmd:help,cmd:status;role:operator=cmd:help,cmd:status,cm
 - RBAC 管「这个用户能做什么动作」
 - owner 管「这个资源属于谁」——由 `TAIJI_FEISHU_OWNERS` 配置
 
-### 8.6 四个容易踩的坑
+### 8.6 五个容易踩的坑
 
 **坑 1：配了 RBAC 后 `TAIJI_USER_PERMISSIONS` 失效。**
 不是合并，是替换。若原来靠它放行工具，必须把工具权限也写进 RBAC 的 role 列表。
@@ -518,6 +534,34 @@ TAIJI_RBAC 配置错误：RBAC 配置有 1 处未定义角色引用：
 
 > **前缀通配必须写 `_*`**：`Infraverse_*` 对，`Infraverse` 错。
 > 后者被当作精确工具名，永远匹配不上。
+
+**坑 5：子角色重复父角色权限点 → 继承失效无法验证。**
+
+若 `operator` 里重复写了 viewer 的 `cmd:help,cmd:status`，则**继承是否生效
+完全看不出来**——operator 自己就有这两条，即使 `parent:` 写错、或继承逻辑
+有 bug，权限判定照样通过。
+
+**实测对比**（2026-09-26）：
+
+| 配置 | 正常时 `cmd:help` | 去掉 `parent:` 后 |
+|---|---|---|
+| **无重复** | 放行（来自继承） | **拒绝** ← 继承可被验证 |
+| 有重复 | 放行 | 仍放行 ← **掩盖了继承失效** |
+
+**正确做法**：子角色**只写自己独有的权限点**，父角色写公共的。
+
+```
+role:viewer=cmd:help,cmd:status          ← 公共权限放父角色
+role:operator=cmd:clear,cmd:stop         ← 子角色只写独有的
+parent:operator=viewer                   ← 继承生效后 operator 自动获得 help/status
+```
+
+**如何自检**：临时删掉 `parent:` 那一项再启动，若 operator 仍能执行
+`/help`，说明它的权限来自**自己写的**（有重复）；若被拒，说明来自继承
+（配置干净）。
+
+> **这条坑的代价**：有重复时功能**照常工作**——只是当继承真的坏掉时，
+> 你不会知道。属于「静默的验证盲区」，不是「功能缺陷」。
 
 ### 8.7 `TAIJI_ALLOW_ALL_USERS`
 
