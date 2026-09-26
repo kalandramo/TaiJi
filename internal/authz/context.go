@@ -69,3 +69,39 @@ func RequireWritable(ctx context.Context) error {
 	}
 	return nil
 }
+
+// ── 资源上下文（issue #6 决策二：resource 注入）──
+//
+// 动机：权限查询是 (谁, 做什么, 对什么) 三元组。前两者已在 ctx 里
+// （Principal / ContextKind），资源标识此前无处承载。
+//
+// 来源：IM 渠道的资源天然是**当前工作区**——管道在路由后即可拿到
+// （server/pipeline.go 的 p.route.WorkspaceID）。
+//
+// v1 不参与判定（权限表只看工具名），但**透传**给 AccessRequest——
+// 这样 v2 资源级判定无需再改消费方（permission_plugin.go）。
+//
+// 与 Principal 的分工：Principal 管「谁」，Resource 管「对什么」，
+// ContextKind 管「来源是否允许写」。三者正交，可同时存在。
+
+type resourceCtxKey struct{}
+
+// WithResource 把资源标识注入上下文。空值等价于未注入。
+func WithResource(ctx context.Context, resource string) context.Context {
+	if ctx == nil || resource == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, resourceCtxKey{}, resource)
+}
+
+// ResourceFrom 读取资源标识。无资源时返回空串。
+//
+// 空串是合法状态（如 CLI 无工作区概念）——调用方据此按「无资源」处理，
+// 不必 fail-closed（资源级判定在 v2，v1 不依赖它）。
+func ResourceFrom(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(resourceCtxKey{}).(string)
+	return v
+}

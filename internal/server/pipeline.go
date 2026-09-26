@@ -234,6 +234,11 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 			msg.MessageID, msg.Platform)
 	}
 
+	// 资源注入：IM 渠道的资源天然是当前工作区（决策二 §3.3）。
+	// v1 不参与判定（权限表只看工具名），但透传给 AccessRequest——
+	// v2 资源级判定无需再改消费方。
+	runCtx = authz.WithResource(runCtx, p.route.WorkspaceID)
+
 	// ── 4. 执行 + 5. 出站 ──
 	//
 	// 两条路径（issue #10）：

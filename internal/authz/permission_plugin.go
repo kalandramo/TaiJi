@@ -68,7 +68,13 @@ func (p *PrincipalPolicyPlugin) beforeTool() tool.BeforeToolCallbackStructured {
 			return denyResult("权限未配置，已拒绝该操作。"), nil
 		}
 
-		allowed, err := p.source.Allowed(ctx, principal, args.ToolName)
+		allowed, err := p.source.Allowed(ctx, AccessRequest{
+			Principal: principal,
+			Action:    args.ToolName,
+			// Resource 来自 ctx（由管道注入工作区 ID）。
+			// v1 不参与判定，但透传——v2 资源级直接可用，无需再改消费方。
+			Resource: ResourceFrom(ctx),
+		})
 		if err != nil {
 			// 查不了 ≠ 不允许。两者都拒，但日志必须区分——
 			// 否则数据源故障会被误读为权限收紧。

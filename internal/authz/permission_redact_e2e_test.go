@@ -57,6 +57,6 @@ func TestRedactEndToEnd_LogsAreSanitized(t *testing.T) {
 
 type probePermSource struct{ allow bool }
 
-func (s *probePermSource) Allowed(context.Context, Principal, string) (bool, error) {
+func (s *probePermSource) Allowed(context.Context, AccessRequest) (bool, error) {
 	return s.allow, nil
 }

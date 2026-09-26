@@ -434,7 +434,7 @@ func TestEnvPermissions_ParsesEntries(t *testing.T) {
 		{"ws1:feishu:ou_unknown", "mockmcp_echo", false},
 	}
 	for _, c := range cases {
-		got, err := src.Allowed(ctx, authz.Principal{Type: "im_user", ID: c.principal}, c.tool)
+		got, err := src.Allowed(ctx, authz.AccessRequest{Principal: authz.Principal{Type: "im_user", ID: c.principal}, Action: c.tool})
 		if err != nil {
 			t.Fatalf("Allowed(%s,%s): %v", c.principal, c.tool, err)
 		}
@@ -452,7 +452,7 @@ func TestEnvPermissions_SkipsMalformedEntries(t *testing.T) {
 		t.Fatal("合法条目应被解析")
 	}
 	ok, _ := src.Allowed(context.Background(),
-		authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, "mockmcp_echo")
+		authz.AccessRequest{Principal: authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, Action: "mockmcp_echo"})
 	if !ok {
 		t.Error("合法条目应生效")
 	}
@@ -462,12 +462,12 @@ func TestEnvPermissions_WhitespaceTolerated(t *testing.T) {
 	t.Setenv("TAIJI_USER_PERMISSIONS", "  ws1:feishu:ou_alice = mockmcp_echo , mockmcp_other  ")
 	src := envPermissions()
 	ok, _ := src.Allowed(context.Background(),
-		authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, "mockmcp_echo")
+		authz.AccessRequest{Principal: authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, Action: "mockmcp_echo"})
 	if !ok {
 		t.Error("应容忍空白")
 	}
 	ok2, _ := src.Allowed(context.Background(),
-		authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, "mockmcp_other")
+		authz.AccessRequest{Principal: authz.Principal{Type: "im_user", ID: "ws1:feishu:ou_alice"}, Action: "mockmcp_other"})
 	if !ok2 {
 		t.Error("第二个工具也应生效")
 	}

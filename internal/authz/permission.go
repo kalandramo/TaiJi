@@ -18,19 +18,37 @@ import (
 	"strings"
 )
 
-// PermissionSource 回答"某主体能否使用某工具"。
+// AccessRequest 是一次权限查询的完整上下文（issue #6 决策二）。
 //
-// 抽象出来的理由：数据源形态可变（静态配置 / 外部权限中心 / 混合），
+// 从 (principal, toolName) 扩为三元组，是为了让「资源级」判定无需二次
+// 改接口——v1 填 Action=工具名、Resource=工作区 ID（由 ctx 注入）。
+//
+// 三者正交：
+//   - Principal 管「谁」
+//   - Action    管「做什么」（v1：工具名；v2：动作如 "ws.modify"）
+//   - Resource  管「对什么」（v1：工作区 ID；v2：细化到路径/参数摘要）
+type AccessRequest struct {
+	// Principal 是发起请求的主体。
+	Principal Principal
+	// Action 是动作标识。v1 即工具名（如 "mockmcp_echo"）。
+	Action string
+	// Resource 是资源标识。v1 为工作区 ID（可能为空——非渠道来源）。
+	Resource string
+}
+
+// PermissionSource 回答"某主体能否执行某动作"。
+//
+// 抽象出来的理由：数据源形态可变（静态配置 / RBAC / 外部权限中心 / 混合），
 // 而消费方（插件）不关心数据从哪来。换数据源只需换实现。
 type PermissionSource interface {
-	// Allowed 判断 principal 能否使用 toolName。
+	// Allowed 判断该请求是否被允许。
 	//
 	// 返回 error 表示**无法判定**（数据源不可达等），与 (false, nil)
 	// 语义不同：
 	//   - (false, nil) —— 查了，不允许
 	//   - (false, err) —— 查不了
 	// 两者都必须拒绝，但日志要区分——否则数据源故障会被误读为权限收紧。
-	Allowed(ctx context.Context, p Principal, toolName string) (bool, error)
+	Allowed(ctx context.Context, req AccessRequest) (bool, error)
 }
 
 // StaticPermissions 是静态权限表（方案 A）。
@@ -82,16 +100,18 @@ func NewStaticPermissions(table map[string][]string) *StaticPermissions {
 //
 // 空主体是**确定的拒绝**（返回 false, nil 而非 error）——它不是查询失败，
 // 而是"没有身份可供判定"。调用方无需特殊处理。
-func (s *StaticPermissions) Allowed(_ context.Context, p Principal, toolName string) (bool, error) {
-	if !p.Valid() || toolName == "" {
+//
+// v1 只看 Action（工具名）：Resource 已透传但不参与判定（资源级是 v2）。
+func (s *StaticPermissions) Allowed(_ context.Context, req AccessRequest) (bool, error) {
+	if !req.Principal.Valid() || req.Action == "" {
 		return false, nil
 	}
-	patterns, ok := s.byPrincipal[p.ID]
+	patterns, ok := s.byPrincipal[req.Principal.ID]
 	if !ok {
 		return false, nil // 未列出的主体：拒绝
 	}
 	for _, pat := range patterns {
-		if matchToolPattern(pat, toolName) {
+		if matchToolPattern(pat, req.Action) {
 			return true, nil
 		}
 	}

@@ -27,8 +27,8 @@ type recordingPermissionSource struct {
 	allow   bool
 }
 
-func (s *recordingPermissionSource) Allowed(_ context.Context, p authz.Principal, toolName string) (bool, error) {
-	s.queries = append(s.queries, p.ID+"|"+toolName)
+func (s *recordingPermissionSource) Allowed(_ context.Context, req authz.AccessRequest) (bool, error) {
+	s.queries = append(s.queries, req.Principal.ID+"|"+req.Action)
 	return s.allow, nil
 }
 

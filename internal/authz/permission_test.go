@@ -19,7 +19,7 @@ func TestStaticPermissions_ExactMatch(t *testing.T) {
 		"ws1:feishu:ou_alice": {"mockmcp_echo"},
 	})
 
-	ok, err := p.Allowed(context.Background(), Principal{ID: "ws1:feishu:ou_alice"}, "mockmcp_echo")
+	ok, err := p.Allowed(context.Background(), AccessRequest{Principal: Principal{ID: "ws1:feishu:ou_alice"}, Action: "mockmcp_echo"})
 	if err != nil {
 		t.Fatalf("Allowed: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestStaticPermissions_UnknownPrincipalDenied(t *testing.T) {
 		"ws1:feishu:ou_alice": {"mockmcp_echo"},
 	})
 
-	ok, err := p.Allowed(context.Background(), Principal{ID: "ws1:feishu:ou_mallory"}, "mockmcp_echo")
+	ok, err := p.Allowed(context.Background(), AccessRequest{Principal: Principal{ID: "ws1:feishu:ou_mallory"}, Action: "mockmcp_echo"})
 	if err != nil {
 		t.Fatalf("Allowed: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestStaticPermissions_ToolNotListedDenied(t *testing.T) {
 		"ws1:feishu:ou_alice": {"mockmcp_echo"},
 	})
 
-	ok, _ := p.Allowed(context.Background(), Principal{ID: "ws1:feishu:ou_alice"}, "srv_dangerous")
+	ok, _ := p.Allowed(context.Background(), AccessRequest{Principal: Principal{ID: "ws1:feishu:ou_alice"}, Action: "srv_dangerous"})
 	if ok {
 		t.Error("未列出的工具应被拒")
 	}
@@ -64,13 +64,13 @@ func TestStaticPermissions_Wildcard(t *testing.T) {
 	ctx := context.Background()
 	alice := Principal{ID: "ws1:feishu:ou_alice"}
 
-	if ok, _ := p.Allowed(ctx, alice, "infraverse_dce_ip"); !ok {
+	if ok, _ := p.Allowed(ctx, AccessRequest{Principal: alice, Action: "infraverse_dce_ip"}); !ok {
 		t.Error("infraverse_* 应匹配 infraverse_dce_ip")
 	}
-	if ok, _ := p.Allowed(ctx, alice, "infraverse_other"); !ok {
+	if ok, _ := p.Allowed(ctx, AccessRequest{Principal: alice, Action: "infraverse_other"}); !ok {
 		t.Error("infraverse_* 应匹配 infraverse_other")
 	}
-	if ok, _ := p.Allowed(ctx, alice, "mockmcp_echo"); ok {
+	if ok, _ := p.Allowed(ctx, AccessRequest{Principal: alice, Action: "mockmcp_echo"}); ok {
 		t.Error("infraverse_* 不应匹配 mockmcp_echo")
 	}
 }
@@ -81,7 +81,7 @@ func TestStaticPermissions_StarAllowsAll(t *testing.T) {
 		"ws1:feishu:ou_admin": {"*"},
 	})
 
-	ok, _ := p.Allowed(context.Background(), Principal{ID: "ws1:feishu:ou_admin"}, "anything_at_all")
+	ok, _ := p.Allowed(context.Background(), AccessRequest{Principal: Principal{ID: "ws1:feishu:ou_admin"}, Action: "anything_at_all"})
 	if !ok {
 		t.Error("\"*\" 应放行任意工具")
 	}
@@ -93,7 +93,7 @@ func TestStaticPermissions_EmptyPrincipalDenied(t *testing.T) {
 		"ws1:feishu:ou_alice": {"mockmcp_echo"},
 	})
 
-	ok, err := p.Allowed(context.Background(), Principal{}, "mockmcp_echo")
+	ok, err := p.Allowed(context.Background(), AccessRequest{Principal: Principal{}, Action: "mockmcp_echo"})
 	if err != nil {
 		t.Fatalf("不应返回 error（空主体是确定的拒绝，非查询失败）: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestStaticPermissions_EmptyPrincipalDenied(t *testing.T) {
 func TestStaticPermissions_NilMapDeniesAll(t *testing.T) {
 	p := NewStaticPermissions(nil)
 
-	ok, err := p.Allowed(context.Background(), Principal{ID: "ws1:feishu:ou_alice"}, "mockmcp_echo")
+	ok, err := p.Allowed(context.Background(), AccessRequest{Principal: Principal{ID: "ws1:feishu:ou_alice"}, Action: "mockmcp_echo"})
 	if err != nil {
 		t.Fatalf("Allowed: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestStaticPermissions_NilMapDeniesAll(t *testing.T) {
 // error 语义：查询失败 ≠ 不允许。前者应返回 error 让调用方区分日志。
 func TestPermissionSource_ErrorMeansUndeterminable(t *testing.T) {
 	failing := &failingSource{}
-	ok, err := failing.Allowed(context.Background(), Principal{ID: "x"}, "y")
+	ok, err := failing.Allowed(context.Background(), AccessRequest{Principal: Principal{ID: "x"}, Action: "y"})
 	if err == nil {
 		t.Error("查询失败应返回 error")
 	}
@@ -135,6 +135,6 @@ var errProbeFailure = errors.New("probe: source unavailable")
 
 type failingSource struct{}
 
-func (f *failingSource) Allowed(context.Context, Principal, string) (bool, error) {
+func (f *failingSource) Allowed(context.Context, AccessRequest) (bool, error) {
 	return false, errProbeFailure
 }
