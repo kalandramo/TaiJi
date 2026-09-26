@@ -14,11 +14,13 @@
 `authz.PermissionSource` 判定链；同时为 `/stop` 引入 per-session 的 context 取消能力
 （当前不存在，见 §2.2 裂缝 1）。
 
-**范围**：6 条命令（`/help`、`/status`、`/clear`、`/stop`、`/owner_mention`、`/release_owner`）
-的识别、权限判定、响应投递；`/stop` 所需的取消基础设施。
+**范围**：**4 条命令**（`/help`、`/status`、`/clear`、`/stop`）的识别、权限判定、
+响应投递；`/stop` 所需的取消基础设施。
 
-**不在范围**：飞书原生指令菜单（平台侧配置，无法用代码验证）、命令别名、
-命令参数解析框架、`/owner_mention` 的 owner 持久化（依赖尚未实现的 owner 存储，见 §11.1）。
+**不在范围**：
+- `/owner_mention`、`/release_owner`——**移出 v1**（需 owner 持久化，见 §11.1.1）
+- 飞书原生指令菜单（平台侧配置，无法用代码验证）
+- 命令别名、命令参数解析框架
 
 ### 1.2 PRD 引用
 
@@ -246,10 +248,19 @@ func (r *CancelRegistry) Cancel(sessionID string) bool
 |---|---|---|---|---|
 | `/help` | `/help` | `cmd:help` | 否 | 遍历注册表生成的命令清单 |
 | `/status` | `/status` | `cmd:status` | 否 | 会话 ID + 队列状态 |
-| `/clear` | `/clear` | `cmd:clear` | **是** | 清除当前会话上下文 |
+| `/clear` | `/clear` | `cmd:clear` | **是** | 派生新 sessionID（§11.1.2） |
 | `/stop` | `/stop` | `cmd:stop` | **是** | 中断当前生成 |
-| `/owner_mention` | `/owner_mention` | `cmd:owner_mention` | 否 | 认领结果（**依赖未实现，见 §11.1**） |
-| `/release_owner` | `/release_owner` | `cmd:release_owner` | **是** | 释放结果（**同上**） |
+
+**v2（本 SPEC 不实现）**：
+
+| 命令 | 为何延后 |
+|---|---|
+| `/owner_mention` | 需 owner 持久化（§11.1.1） |
+| `/release_owner` | 同上 |
+
+> **不注册即不可用**：注册表里没有这两条 → 用户发 `/owner_mention`
+> 会走**正常消息路径**（被当普通文本送模型），不会报错也不会误触发。
+> 这是有意的——比注册一个「暂不可用」的占位更干净（无死代码）。
 
 ### 4.2 请求/响应形态
 
@@ -600,17 +611,52 @@ flowchart LR
 
 ### 11.1 未决问题
 
-1. **`/owner_mention` 与 `/release_owner` 的持久化依赖**
-   —— FR-10.5 要求 owner 认领/释放，但**owner 存储尚未实现**（`principal.go` 的
-   `IsOwner` 只做静态比对，无持久化）。本 SPEC 把这两条命令列入清单
-   （PRD 要求），但**其 Handler 依赖一个尚不存在的 owner 存储**。
+> **两处均已决策（2026-09-24）**，见下。
 
-   **建议**：这两条命令的实现**延后到 owner 存储落地**，本 SPEC 只定义接口形态。
-   在命令注册表中可先注册为「暂不可用」并在响应中说明。
+1. **`/owner_mention` 与 `/release_owner` → 决策：移出 v1 范围（路径 A）**
 
-2. **`/clear` 的语义边界**——清除会话上下文是指「清空 session service 的历史」
-   还是「开新 sessionID」？前者需要访问 `runner` 的 session service（当前无暴露接口），
-   后者只需换 sessionID。**建议 v1 用后者**（换 sessionID），成本低且语义清晰。
+   **决策依据**：这两条命令需要 owner 的**可写存储**，而现状是
+   **启动期静态列表**（实测：`TAIJI_FEISHU_OWNERS` 环境变量 → `main.go:576-581`
+   → `GateConfig.Owners` → `authz.IsOwner`，`principal.go:129` 是**纯函数**）。
+
+   要做 `/owner_mention` 需三样新东西：
+
+   | 需要 | 现状 | 缺口 |
+   |---|---|---|
+   | owner 可写存储 | 无（环境变量只读） | 需新增 |
+   | 动态判定（读存储而非配置） | `IsOwner` 纯函数 | 需接口化 |
+   | 多租户隔离（按 workspace 分片） | 全局一份列表 | 需新增 |
+
+   **代价**：`IsOwner` 被 3 处消费（`gate.go:125`、`pipeline.go:165`、测试），
+   改成接口会波及**门禁**——那是安全边界，风险高于命令系统本身。
+
+   **不做的理由（称量）**：它现在**没有消费者**。v1 的 owner 由运维在部署时配好，
+   单租户原型足够；`/owner_mention` 的价值是多租户自助认领，
+   而 `07-RBAC权限设计.md:64` 刚论证过「个位数用户时 RBAC 是过度设计」。
+   引入它 = 新增存储 + 改安全边界 + 迁移成本，换一个当前用不上的能力
+   （与「casbin 不引入」同一取舍）。
+
+   **本 SPEC 的处理**：§4.1 的命令清单中这两条标注为「v2」，
+   实现 P2 时**不注册**它们（注册表里不存在 → 用户发 `/owner_mention`
+   会走正常消息路径，被当普通文本送模型）。
+
+   > **若将来要做**：它是**独立 SPEC**（涉及安全边界 + 存储 + 迁移），
+   > 不应塞进命令系统。触发条件：需要多租户自助认领 owner 时。
+
+2. **`/clear` 的语义边界 → 决策：换 sessionID**
+
+   **理由**：清空 session service 的历史需要访问 `runner` 的内部 session service
+   （当前无暴露接口，`execute.go` 的 `assembly` 未导出它）；换 sessionID
+   只需在路由层派生新 ID，成本低且语义清晰——「新会话」是用户可理解的模型。
+
+   **实现方式**：`/clear` 为当前会话派生一个**新的 sessionID**（如
+   `{effectiveJID}#gen:{n}`，n 递增），后续消息用新 ID → 历史自然隔离。
+
+   **代价（明说）**：旧 session 的数据**不删除**（仍在 session service 内存里），
+   只是不再被引用。对原型可接受（进程重启即释放）；若将来需要真删除，
+   需暴露 session service 的删除接口。
+
+   **副产物**：`/clear` 的响应应告知新会话 ID 的后缀，便于排障。
 
 ### 11.2 技术风险
 
