@@ -474,7 +474,7 @@ TAIJI_RBAC="role:admin=*;role:operator=mockmcp_echo,infraverse_*;parent:operator
 | AC-2 | 角色继承正确展开 | 单测：子角色继承父角色权限 |
 | AC-3 | 未绑定用户拒绝（fail-closed） | 单测：空 user_roles → 拒 |
 | AC-4 | 通配匹配与现有语义一致 | 单测：复用 `matchToolPattern` 的用例 |
-| AC-5 | 拒绝日志含完整链路 | 单测：断言日志含 user→role→permission |
+| AC-5 | 拒绝日志含审计三要素（principal + action + resource） | 单测：断言日志含三者；**角色链路（user→role→permission）v2 追加**（需 RBAC 侧暴露判定依据，当前接口契约是纯判定） |
 | AC-6 | owner 判定不受影响 | 回归：既有 `gate_test.go` / `principal_test.go` 全绿 |
 
 ---

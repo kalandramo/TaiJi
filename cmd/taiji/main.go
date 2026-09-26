@@ -158,7 +158,9 @@ func runChat(args []string) int {
 	//
 	// 若用户设了任一权限变量（误以为对 CLI 生效），显式提示而非静默忽略——
 	// 否则「配了却不生效」又是一个静默缺口。
-	if envRBAC() != nil || envPermissions() != nil {
+	// 这里只判断「是否配了」，不校验（CLI 不消费权限，配置错误留待 serve 暴露）。
+	if strings.TrimSpace(os.Getenv("TAIJI_RBAC")) != "" ||
+		strings.TrimSpace(os.Getenv("TAIJI_USER_PERMISSIONS")) != "" {
 		fmt.Fprintf(os.Stderr,
 			"taiji chat: 注意——用户级权限配置（TAIJI_RBAC / TAIJI_USER_PERMISSIONS）"+
 				"对 CLI 无效（权限按 IM 主体判定，CLI 无 IM 身份）。该配置仅 serve 生效。\n")
@@ -447,7 +449,14 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	// 与 CLI 不同，serve 面向多个 IM 用户，缺权限表 = 任何能触发 bot 的人
 	// 都能用所有已放行工具（安全边界消失）。故此处 fail-fast——
 	// 有工具但无决策时拒绝启动，而非运行期静默放行。
-	permissions := resolvePermissions()
+	//
+	// RBAC 配置有误（引用未定义角色）时 resolvePermissions 返回 error，
+	// 同样 fail-fast——否则该用户会被静默拒绝（「配了却不生效」）。
+	permissions, err := resolvePermissions()
+	if err != nil {
+		bootstrap.CloseMCPSets(toolSets)
+		return nil, err
+	}
 	if permissions != nil {
 		switch sp := permissions.(type) {
 		case *authz.RBACPermissions:
@@ -797,11 +806,14 @@ func envMaxToolIterations() int {
 // 主体 ID 形态为 {workspace}:{platform}:{open_id}（与 authz.ResolvePrincipal 一致）。
 // 权限点支持 "*" 与 "prefix_*" 通配（复用 matchToolPattern 语义）。
 //
-// 返回 nil 表示未配置——此时回退到 TAIJI_USER_PERMISSIONS（迁移期并存）。
-func envRBAC() authz.PermissionSource {
+// 返回 (nil, nil) 表示未配置——此时回退到 TAIJI_USER_PERMISSIONS（迁移期并存）。
+//
+// 配置有误（如引用未定义角色）时返回 error——**fail-fast**，而非静默
+// 让部分用户被拒。这是「配了却不生效」类静默失效的根治（与缺口 3 同源）。
+func envRBAC() (authz.PermissionSource, error) {
 	raw := strings.TrimSpace(os.Getenv("TAIJI_RBAC"))
 	if raw == "" {
-		return nil
+		return nil, nil
 	}
 	roles := make(map[string][]string)
 	userRoles := make(map[string][]string)
@@ -841,11 +853,16 @@ func envRBAC() authz.PermissionSource {
 		}
 	}
 
-	return authz.NewRBACPermissions(authz.RBACConfig{
+	cfg := authz.RBACConfig{
 		Roles:       roles,
 		UserRoles:   userRoles,
 		RoleParents: roleParents,
-	})
+	}
+	// 校验：所有被引用的角色必须已定义——否则用户会被静默拒绝。
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("TAIJI_RBAC 配置错误：%w", err)
+	}
+	return authz.NewRBACPermissions(cfg), nil
 }
 
 // splitCSV 按逗号切分并去空白，丢弃空项。
@@ -862,15 +879,19 @@ func splitCSV(v string) []string {
 // resolvePermissions 返回生效的用户级权限源。
 //
 // 优先级：TAIJI_RBAC（RBAC）> TAIJI_USER_PERMISSIONS（静态表）。
-// 两者都未配 → nil（不做用户级判定；serve 路径会因此拒绝启动，见
-// validateServePermissions）。
+// 两者都未配 → (nil, nil)（不做用户级判定；serve 路径会因此拒绝启动，
+// 见 validateServePermissions）。
+//
+// RBAC 配置有误时返回 error——调用方应 fail-fast。
 //
 // 为什么并存而非替换：这是迁移期——现有部署可能已在用
 // TAIJI_USER_PERMISSIONS，直接替换会让它们静默失效（项目取向：
 // 静默失效最难排查）。RBAC 是更完整的模型，新部署应优先用它。
-func resolvePermissions() authz.PermissionSource {
-	if p := envRBAC(); p != nil {
-		return p
+func resolvePermissions() (authz.PermissionSource, error) {
+	if p, err := envRBAC(); err != nil {
+		return nil, err
+	} else if p != nil {
+		return p, nil
 	}
-	return envPermissions()
+	return envPermissions(), nil
 }

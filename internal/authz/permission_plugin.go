@@ -78,16 +78,21 @@ func (p *PrincipalPolicyPlugin) beforeTool() tool.BeforeToolCallbackStructured {
 		if err != nil {
 			// 查不了 ≠ 不允许。两者都拒，但日志必须区分——
 			// 否则数据源故障会被误读为权限收紧。
-			p.log("denied: permission source unavailable (principal=%s tool=%s err=%v)",
-				principal.Redacted(), args.ToolName, err)
+			p.log("denied: permission source unavailable (principal=%s tool=%s resource=%q err=%v)",
+				principal.Redacted(), args.ToolName, ResourceFrom(ctx), err)
 			return denyResult("权限校验暂时不可用，请稍后重试。"), nil
 		}
 		if !allowed {
-			p.log("denied: not permitted (principal=%s tool=%s)", principal.Redacted(), args.ToolName)
+			// 日志含 principal + action + resource（审计三要素：谁/做什么/对什么）。
+			// 角色链路（user→role→permission）在 v2 追加——需 RBAC 侧暴露
+			// 判定依据，当前接口契约是纯判定（见 07 文档 §9 AC-5）。
+			p.log("denied: not permitted (principal=%s tool=%s resource=%q)",
+				principal.Redacted(), args.ToolName, ResourceFrom(ctx))
 			return denyResult(denyMessage(args.ToolName)), nil
 		}
 
-		p.log("allowed: principal=%s tool=%s", principal.Redacted(), args.ToolName)
+		p.log("allowed: principal=%s tool=%s resource=%q",
+			principal.Redacted(), args.ToolName, ResourceFrom(ctx))
 		return nil, nil // 放行
 	}
 }

@@ -2,6 +2,8 @@ package authz
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -107,6 +109,56 @@ func collectPermissions(roles []string, rolePerms, roleParents map[string][]stri
 		}
 	}
 	return order
+}
+
+// Validate 校验配置的一致性：所有被引用的角色名必须**已定义**。
+//
+// 动机（实测发现的静默失效）：若 user 绑定到一个不存在的角色（拼写错误），
+// 该用户的权限为空 → 所有工具调用被拒，而启动无提示。parent 引用不存在的
+// 角色同理（死引用）。这两类都是「配了却不生效」的静默失效。
+//
+// 「已定义」的两个来源：
+//   - Roles 的键（有直接权限的角色）
+//   - RoleParents 的键（分组角色，可能无直接权限）
+//
+// **RoleParents 的值不构成定义**——一个「只被继承、自身无权限定义」的角色
+// 在 v1 静态配置下没有意义（不带来权限，只让继承链多一跳），且极可能是
+// 拼写错误。把它当已定义会放过这类错误（实测暴露的漏洞）。
+//
+// 全部错误一次性列出（便于一次修完，而非逐个试）。
+func (c RBACConfig) Validate() error {
+	defined := make(map[string]bool)
+	for name := range c.Roles {
+		defined[name] = true
+	}
+	for name := range c.RoleParents {
+		defined[name] = true
+	}
+
+	var problems []string
+	for user, roles := range c.UserRoles {
+		for _, r := range roles {
+			if r = strings.TrimSpace(r); r != "" && !defined[r] {
+				problems = append(problems,
+					fmt.Sprintf("user %q 引用了未定义的角色 %q", user, r))
+			}
+		}
+	}
+	for child, parents := range c.RoleParents {
+		for _, p := range parents {
+			if p = strings.TrimSpace(p); p != "" && !defined[p] {
+				problems = append(problems,
+					fmt.Sprintf("parent %q 引用了未定义的角色 %q", child, p))
+			}
+		}
+	}
+
+	if len(problems) == 0 {
+		return nil
+	}
+	sort.Strings(problems) // 稳定输出，便于测试与阅读
+	return fmt.Errorf("RBAC 配置有 %d 处未定义角色引用：\n  - %s",
+		len(problems), strings.Join(problems, "\n  - "))
 }
 
 // Allowed 实现 PermissionSource。

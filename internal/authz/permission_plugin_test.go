@@ -2,6 +2,7 @@ package authz
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -148,4 +149,32 @@ func runBeforeTool(t *testing.T, p *PrincipalPolicyPlugin, ctx context.Context, 
 		t.Fatalf("beforeTool 返回 error: %v", err)
 	}
 	return res
+}
+
+// 拒绝日志含审计三要素（AC-5：principal + action + resource）。
+//
+// 动机：审计要求「谁 / 做什么 / 对什么」。resource 是 v1 新增的上下文
+// 维度（工作区 ID），若不进日志则审计缺一半。
+func TestPrincipalPolicy_DenyLogIncludesResource(t *testing.T) {
+	var logs []string
+	plugin := NewPrincipalPolicyPlugin(
+		NewStaticPermissions(nil), // 拒绝一切
+		func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+	)
+
+	ctx := WithPrincipal(context.Background(), Principal{ID: "ws1:feishu:ou_alice"})
+	ctx = WithResource(ctx, "ws-42")
+
+	runBeforeTool(t, plugin, ctx, "mockmcp_echo")
+
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "ws-42") {
+		t.Errorf("拒绝日志应含 resource（ws-42），got: %s", joined)
+	}
+	if !strings.Contains(joined, "ou_alice") && !strings.Contains(joined, "ws1:feishu") {
+		t.Errorf("拒绝日志应含 principal 标识，got: %s", joined)
+	}
+	if !strings.Contains(joined, "mockmcp_echo") {
+		t.Errorf("拒绝日志应含 action（工具名），got: %s", joined)
+	}
 }
