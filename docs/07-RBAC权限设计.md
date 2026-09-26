@@ -240,16 +240,26 @@ flowchart LR
 ```
 Role: operator
   permissions:
-    - "tool:mockmcp_echo"       # 工具级（v1 主体）
-    - "tool:infraverse_*"       # 通配
-    - "ws:modify"               # 资源级动作（v2 启用）
+    - "mockmcp_echo"            # 工具级（v1：**裸工具名**）
+    - "infraverse_*"            # 通配（前缀匹配）
+    - "ws:modify"               # 资源级动作（v2 启用，带前缀）
 ```
 
-**为什么用 action 型而非直接列工具名**：
+> **v1 权限点用裸工具名，不加 `tool:` 前缀**（2026-09-26 修订）。
+> 理由：MCP 工具名本身已带 `{server}_` 前缀（`mockmcp_echo`），再叠 `tool:`
+> 是三层冗余。而 v2 的 `ws:modify` 是**非工具**动作，才需前缀区分——
+> 所以「工具级裸名 + 资源级带前缀」是自洽的。
+>
+> **实测教训**：本示例原写 `tool:mockmcp_echo`，与实现（匹配裸名）矛盾——
+> 照示例配会**静默拒绝**。现已固化为测试
+> （`cmd/taiji/rbac_test.go` 的 `TestEnvRBAC_DocExampleConfigWorks`），
+> 文档与实现不一致时测试变红。
+
+**为什么用 action 型而非直接列工具名**（v2 的前瞻）：
 
 1. 权限点可跨角色复用（`ws:modify` 多个角色都要）；
 2. 审计时「为什么被拒」能追到具体动作，而非笼统角色名；
-3. v2 资源级扩展时，权限点空间不变（只是 action 从 `tool:x` 增到 `ws:modify`）。
+3. v2 资源级扩展时，权限点空间不变（只是 action 从裸工具名增到 `ws:modify`）。
 
 ### 4.3 User 主体的着落
 
@@ -274,11 +284,15 @@ FR-10.8（`01-需求文档.md:536`）要求「用户在 Web 端完成身份绑�
 # v1：单环境变量，分号分隔条目
 TAIJI_RBAC="
   role:admin=*;
-  role:operator=tool:mockmcp_echo,tool:infraverse_*;
+  role:operator=mockmcp_echo,infraverse_*;
+  parent:operator=viewer;
   user:ws1:feishu:ou_alice=admin;
   user:ws1:feishu:ou_bob=operator
 "
 ```
+
+> 三类前缀：`role:`（角色→权限）、`parent:`（RBAC1 继承）、`user:`（用户→角色）。
+> 权限点用**裸工具名**（见 §4.2）。
 
 > **配置形态是 v1 的临时选择**——正式形态应是 YAML（可读性远好于环境变量）。
 > 但环境变量与现有 `envPermissions` 同源，迁移期可两者并存，故 v1 优先。
@@ -476,6 +490,8 @@ TAIJI_RBAC="role:admin=*;role:operator=mockmcp_echo,infraverse_*;parent:operator
 | AC-4 | 通配匹配与现有语义一致 | 单测：复用 `matchToolPattern` 的用例 |
 | AC-5 | 拒绝日志含审计三要素（principal + action + resource） | 单测：断言日志含三者；**角色链路（user→role→permission）v2 追加**（需 RBAC 侧暴露判定依据，当前接口契约是纯判定） |
 | AC-6 | owner 判定不受影响 | 回归：既有 `gate_test.go` / `principal_test.go` 全绿 |
+| AC-7 | **真 RBAC 经完整链路被消费**（接缝验证） | e2e：`internal/chat/rbac_wiring_test.go`（授权/未绑定/未授权/继承，真 `RBACPermissions` 装配进 Executor） |
+| AC-8 | **文档示例可执行**（防文档-实现漂移） | 单测：`TestEnvRBAC_DocExampleConfigWorks` 固化 §4.4 示例 |
 
 ---
 

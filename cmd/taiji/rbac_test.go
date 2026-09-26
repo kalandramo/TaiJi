@@ -147,3 +147,43 @@ func TestResolvePermissions_PropagatesRBACError(t *testing.T) {
 		t.Fatal("RBAC 配置错误应向上传递，而非回退到静态表")
 	}
 }
+
+// 文档示例的配置形态必须能被解析并正确匹配（防文档-实现漂移）。
+//
+// 背景（实测发现的漂移）：文档 §4.4 示例曾写 `role:operator=tool:mockmcp_echo`
+// （带 tool: 前缀），但实现匹配**裸工具名**——照示例配会静默拒绝。
+// 本测试把**当前文档示例**固化为可执行断言：文档与实现不一致时变红。
+//
+// 当前约定：v1 权限点用**裸工具名**（MCP 工具名本身已带 {server}_ 前缀，
+// 再叠 tool: 是冗余）；v2 资源级动作用 "ws:" 等前缀区分（非工具名）。
+func TestEnvRBAC_DocExampleConfigWorks(t *testing.T) {
+	// 与文档 §4.4 示例一致（裸工具名形态）。
+	t.Setenv("TAIJI_RBAC",
+		"role:admin=*;role:operator=mockmcp_echo,infraverse_*;"+
+			"user:ws1:feishu:ou_alice=admin;user:ws1:feishu:ou_bob=operator")
+
+	src, err := envRBAC()
+	if err != nil {
+		t.Fatalf("文档示例应能被解析: %v", err)
+	}
+	ctx := context.Background()
+
+	// admin（*）→ 任意工具
+	if ok, _ := src.Allowed(ctx, authz.AccessRequest{
+		Principal: authz.Principal{ID: "ws1:feishu:ou_alice"}, Action: "mockmcp_echo",
+	}); !ok {
+		t.Error("admin 应放行 mockmcp_echo（文档示例）")
+	}
+	// operator → 精确名
+	if ok, _ := src.Allowed(ctx, authz.AccessRequest{
+		Principal: authz.Principal{ID: "ws1:feishu:ou_bob"}, Action: "mockmcp_echo",
+	}); !ok {
+		t.Error("operator 应放行 mockmcp_echo（文档示例的精确名）")
+	}
+	// operator → 通配
+	if ok, _ := src.Allowed(ctx, authz.AccessRequest{
+		Principal: authz.Principal{ID: "ws1:feishu:ou_bob"}, Action: "infraverse_dce_ip",
+	}); !ok {
+		t.Error("operator 的 infraverse_* 应匹配（文档示例的通配）")
+	}
+}
