@@ -307,19 +307,28 @@ func (r *CancelRegistry) Cancel(sessionID string) bool
 
 ### 5.1 命令分发（核心算法）
 
+> **实现修正（2026-09-24）**：本 SPEC 初稿把「命令判定」放在**路由之前**
+> （原伪代码第 2 步）。实现 P4 时发现这不可行——`/clear` 与 `/stop` 需要
+> `sessionID`（= 路由后的 `EffectiveJID`），而它由路由产生。
+>
+> 实际顺序：门禁 → **路由** → 命令判定 → 串行化。
+>
+> **关键性质不变**：命令判定仍在**串行化之前**——这是 §5.4 关键设计点 2
+> 的要求（否则 `/stop` 会排在正在生成的 run 后面等待，永远无法中断）。
+
 ```
 Handle(ctx, msg):
   1. 门禁（既有，不变）
-  2. **命令判定（新增）**
-     if cmdName, args, ok := registry.Parse(msg.Content); ok {
-         return p.handleCommand(ctx, msg, cmdName, args)
+  2. 路由（既有）—— 必须先于命令判定，因为命令需要 sessionID
+  3. **命令判定（新增）**
+     if res := registry.Parse(msg.Content); res.OK {
+         return p.handleCommand(ctx, msg, res)
      }
-  3. 路由（既有）
   4. 串行化（既有）
   5. 执行（既有）
 
-handleCommand(ctx, msg, name, args):
-  a. 构造 Principal（复用 pipeline.go:225 的 ResolvePrincipal）
+handleCommand(ctx, msg, res):
+  a. 构造 Principal（复用 pipeline.go 的 ResolvePrincipal）
   b. 权限判定：source.Allowed(AccessRequest{
          Principal: principal,
          Action:    "cmd:" + name,

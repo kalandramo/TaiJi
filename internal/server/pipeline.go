@@ -23,6 +23,7 @@ import (
 
 	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/channel"
+	"github.com/kalandramo/TaiJi/internal/channel/cmd"
 	"github.com/kalandramo/TaiJi/internal/concurrency"
 )
 
@@ -79,6 +80,49 @@ type Config struct {
 	// 依据 §4.4.1：原型用「先发占位 → 收到回答后更新」的简化版流式，
 	// 代替 happyclaw 的 CardKit 状态机。代价是看不到逐 token 打字效果。
 	Placeholder string
+
+	// Commands 是命令注册表（issue 命令系统）。
+	//
+	// **nil 表示禁用命令功能**——所有 `/xxx` 走正常消息路径。
+	// 这是刻意的向后兼容：既有 5 个测试夹具无需改动即可继续工作。
+	Commands *cmd.Registry
+
+	// Permissions 是用户级权限源（命令权限判定用）。
+	//
+	// 注意：这是**第二条** PermissionSource 引用——第一条在
+	// chat.Options.Permissions（工具权限判定，见 execute.go 的装配链）。
+	//
+	// 为什么需要两条：工具权限判定挂在 beforeTool 回调上，只在
+	// **工具调用**时触发；命令不经过工具链，故必须单独判定。
+	// （SPEC §2.2 裂缝 2）
+	//
+	// nil 表示**拒绝一切命令**（fail-closed）——与既有取向一致。
+	Permissions authz.PermissionSource
+
+	// OwnerCheck 判断某 open_id 是否为工作区 owner（命令的 OwnerOnly 判定用）。
+	//
+	// 传函数而非列表：owner 的判定逻辑可能变化（v2 的持久化 owner），
+	// 而管道只关心「他是不是 owner」这个事实。
+	//
+	// nil 表示**任何 OwnerOnly 命令都被拒**（fail-closed）。
+	OwnerCheck func(openID string) bool
+
+	// SessionGen 返回会话的当前代数（/clear 用，SPEC §11.1.2）。
+	//
+	// nil 表示 /clear 不可用（Handler 会返回错误）。
+	SessionGen SessionGenFunc
+}
+
+// SessionGenFunc 是会话代数的管理面（/clear 的基础设施）。
+//
+// 为什么是接口而非直接改 sessionID：管道传给执行层的 sessionID 是
+// 路由派生的 EffectiveJID。换 sessionID 意味着在它之上叠一层代数后缀——
+// 由实现方决定如何派生（如 "{jid}#gen:{n}"）。
+type SessionGenFunc interface {
+	// Current 返回 sessionID 的当前代数（0 表示未派生过）。
+	Current(sessionID string) int
+	// Next 让 sessionID 进入新的一代，返回新代数。
+	Next(sessionID string) int
 }
 
 // DefaultPlaceholder 是占位消息的默认文本。
@@ -112,6 +156,15 @@ type Pipeline struct {
 	serializer  *concurrency.Serializer
 	logf        func(format string, args ...any)
 	placeholder string
+
+	// ── 命令系统（issue 命令系统）──
+	commands    *cmd.Registry
+	permissions authz.PermissionSource
+	ownerCheck  func(openID string) bool
+	sessionGen  SessionGenFunc
+	// cancels 是 /stop 的基础设施（SPEC §5.4）。
+	// 恒非 nil——即使命令功能未启用，注册表本身零成本。
+	cancels *CancelRegistry
 }
 
 // New 装配管道。
@@ -141,8 +194,16 @@ func New(cfg Config) (*Pipeline, error) {
 		serializer:  concurrency.NewSerializer(),
 		logf:        logf,
 		placeholder: placeholder,
+		commands:    cfg.Commands,
+		permissions: cfg.Permissions,
+		ownerCheck:  cfg.OwnerCheck,
+		sessionGen:  cfg.SessionGen,
+		cancels:     NewCancelRegistry(),
 	}, nil
 }
+
+// CancelRegistry 返回 /stop 使用的取消注册表（供外部观测，如测试）。
+func (p *Pipeline) CancelRegistry() *CancelRegistry { return p.cancels }
 
 // Handle 处理一条入站消息。
 //
@@ -174,6 +235,25 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 	// 会话标识含渠道前缀与 workspace，防跨渠道撞车（issue #7）。
 	target := channel.ResolveRoute(p.route, msg)
 	p.logf("server: routed message_id=%s jid=%s", msg.MessageID, target.EffectiveJID)
+
+	// ── 2.5 命令判定（新增，SPEC §5.1）──
+	//
+	// **位置**：门禁之后（命令不绕过安全边界）、串行化之前。
+	//
+	// 为什么在串行化之前：/stop 必须能中断正在执行的 run。
+	// 若它排在串行化域后面，会等 run 结束才执行——永远无法中断
+	// （SPEC §5.4 关键设计点 2，本设计最易做错处）。
+	//
+	// 为什么在路由之后：/clear 与 /stop 需要 sessionID
+	// （= target.EffectiveJID），它由路由产生（SPEC §5.1 实现修正）。
+	//
+	// 未命中注册表时**返回 false 而非报错**——走正常消息路径。
+	// 这保证 `/usr/local/bin 是什么` 这类文本不被误伤（FR-C1）。
+	if p.commands != nil {
+		if res := p.commands.Parse(msg.Content); res.OK {
+			return p.handleCommand(ctx, msg, target, res)
+		}
+	}
 
 	// ── 3. 串行化 ──
 	// 同 workspace 的消息共享串行化域（issue #8），保证同一份 session log
@@ -249,6 +329,154 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 	// 设计文档 §4.4 定义了降级矩阵。
 	receiver, idType := receiverOf(msg)
 	return p.deliverAnswer(runCtx, target.EffectiveJID, msg, receiver, idType)
+}
+
+// handleCommand 处理一条命令（SPEC §5.1）。
+//
+// 三层判定（缺一不可，SPEC §7.1）：
+//
+//	① 门禁——已在 Handle 中完成（命令不绕过）
+//	② 命令权限——cmd:<name> 权限点，经 PermissionSource
+//	③ OwnerOnly——资源归属判定，与 RBAC 正交
+//
+// 返回 nil 表示「已处理」（**包括被拒的情况**——拒绝是正常路径，
+// 不是错误，与门禁拒绝的语义一致）。
+func (p *Pipeline) handleCommand(
+	ctx context.Context,
+	msg *channel.IncomingMessage,
+	target channel.RouteTarget,
+	res cmd.ParseResult,
+) error {
+	cmdDef, ok := p.commands.Lookup(res.Name)
+	if !ok {
+		// 理论上不可达（Parse 已确认注册）。保守返回 nil 并留痕。
+		p.logf("server: command vanished after parse name=%s message_id=%s",
+			res.Name, msg.MessageID)
+		return nil
+	}
+
+	receiver, idType := receiverOf(msg)
+
+	// ── ② 命令权限判定 ──
+	//
+	// 为什么显式判定而非依赖 beforeTool 插件：命令不经过工具链，
+	// 插件只在工具调用时触发（SPEC §2.2 裂缝 2）。
+	principal := authz.ResolvePrincipal(authz.PrincipalInput{
+		ChannelID: p.route.WorkspaceID,
+		Platform:  string(msg.Platform),
+		OpenID:    msg.UserID,
+	})
+	if allowed, err := p.commandAllowed(ctx, principal, res.Name); err != nil {
+		// 「查不了」≠「不允许」——两者都拒，但文案与日志区分
+		// （复用 permission_plugin.go 的既有语义）。
+		p.logf("server: command permission check failed name=%s principal=%s err=%v",
+			res.Name, principal.Redacted(), err)
+		return p.replyCommand(ctx, receiver, idType,
+			"权限校验暂时不可用，请稍后重试。")
+	} else if !allowed {
+		p.logf("server: command denied name=%s principal=%s（cmd:%s）",
+			res.Name, principal.Redacted(), res.Name)
+		return p.replyCommand(ctx, receiver, idType,
+			fmt.Sprintf("你没有使用命令 /%s 的权限。这是确定性拒绝，重试不会成功。", res.Name))
+	}
+
+	// ── ③ OwnerOnly 判定 ──
+	if cmdDef.OwnerOnly && !p.isOwner(msg.UserID) {
+		// 日志用脱敏后的 principal（复用已有的 Redacted，不打印裸 open_id）。
+		p.logf("server: command owner-only denied name=%s principal=%s message_id=%s",
+			res.Name, principal.Redacted(), msg.MessageID)
+		return p.replyCommand(ctx, receiver, idType,
+			"只有工作区 owner 才能执行此命令。")
+	}
+
+	// ── ④ 执行 ──
+	reply, err := cmdDef.Handler(cmd.Request{
+		Args:         res.Args,
+		SessionID:    target.EffectiveJID,
+		SessionGen:   p.sessionGenOf(target.EffectiveJID),
+		QueuePending: p.pendingCount(),
+		WorkspaceID:  p.route.WorkspaceID,
+	})
+	if err != nil {
+		p.logf("server: command handler failed name=%s message_id=%s err=%v",
+			res.Name, msg.MessageID, err)
+		return p.replyCommand(ctx, receiver, idType,
+			fmt.Sprintf("命令执行失败：%v", err))
+	}
+
+	p.logf("server: command executed name=%s principal=%s message_id=%s",
+		res.Name, principal.Redacted(), msg.MessageID)
+	return p.replyCommand(ctx, receiver, idType, reply)
+}
+
+// commandAllowed 判定命令权限（SPEC §5.3）。
+//
+// 权限点形态 `cmd:<name>`。fail-closed：权限源为 nil 或主体无效时拒绝。
+//
+// 返回值语义（与 PermissionSource 一致）：
+//   - (false, nil) —— 查了，不允许
+//   - (false, err) —— 查不了
+func (p *Pipeline) commandAllowed(
+	ctx context.Context,
+	principal authz.Principal,
+	name string,
+) (bool, error) {
+	if p.permissions == nil {
+		// 未配权限源 = 拒绝一切命令（fail-closed）。
+		// 这不是「查不了」，而是「没配」——返回 (false, nil)。
+		return false, nil
+	}
+	if !principal.Valid() {
+		return false, nil // 无身份，无法判定
+	}
+	return p.permissions.Allowed(ctx, authz.AccessRequest{
+		Principal: principal,
+		Action:    "cmd:" + name,
+		Resource:  p.route.WorkspaceID,
+	})
+}
+
+// isOwner 判定发送者是否为工作区 owner。
+//
+// fail-closed：未装配 OwnerCheck 时一律 false（任何 OwnerOnly 命令被拒）。
+// 与 authz.IsOwner 的取向一致（无 owner 信息即拒绝，不静默放行）。
+func (p *Pipeline) isOwner(openID string) bool {
+	if p.ownerCheck == nil || openID == "" {
+		return false
+	}
+	return p.ownerCheck(openID)
+}
+
+// sessionGenOf 返回会话代数（未装配时 0）。
+func (p *Pipeline) sessionGenOf(sessionID string) int {
+	if p.sessionGen == nil {
+		return 0
+	}
+	return p.sessionGen.Current(sessionID)
+}
+
+// pendingCount 返回待处理消息数（/status 展示用）。
+//
+// 当前无队列引用（Dispatcher 在另一层），返回 0——
+// 这是**诚实的占位**：宁可显示 0 也不编造数字。
+func (p *Pipeline) pendingCount() int { return 0 }
+
+// replyCommand 投递命令回复（SPEC §5.1 步骤 e）。
+//
+// 与 deliverAsText 的区别：命令**不调用模型**、**不写会话历史**、
+// **不占串行域**——它只是一次出站。
+func (p *Pipeline) replyCommand(
+	ctx context.Context,
+	receiver string,
+	idType channel.ReceiveIDType,
+	text string,
+) error {
+	if _, err := p.sender.SendMessage(ctx, receiver, text, channel.SendOptions{
+		ReceiveIDType: idType,
+	}); err != nil {
+		return fmt.Errorf("server: reply command: %w", err)
+	}
+	return nil
 }
 
 // deliverAnswer 执行并把回答投递到渠道（含卡片流式与文本降级）。
