@@ -1,7 +1,7 @@
 # Taiji · RBAC 权限体系接入设计
 
 > 项目：**taiji**（Go 原生 Agent Harness 原型）
-> 状态：**设计定稿；安全欠债（缺口 1/3/4）已修，RBAC 本体（Wave 1/2）待落代码**
+> 状态：**RBAC 本体（Wave 1/2）已落代码；安全欠债（缺口 1/3/4）已修；资源级（Wave 4）待 v2**
 > 前置：`03-原型设计文档.md` §4.3 权限三层、`01-需求文档.md` FR-10.5~10.9
 > 参照系：`happyclaw/docs/ACL-MATRIX.md`（12 层权限矩阵，源码直读）
 
@@ -420,7 +420,7 @@ mockmcp 的 `echo` 声明 `readOnlyHint=true` 后读到 `readOnly=true`。
 
 ## 8. 分波实施计划
 
-### Wave 1：接口扩展（决策二）
+### Wave 1：接口扩展（决策二）—— **已完成**（2026-09-26）
 
 - 新增 `AccessRequest` 结构（`permission.go`）；
 - 改 `PermissionSource.Allowed` 签名；
@@ -429,7 +429,21 @@ mockmcp 的 `echo` 声明 `readOnlyHint=true` 后读到 `readOnly=true`。
 - 适配 `StaticPermissions`、`permission_plugin.go:71`、17 处测试调用点；
 - **验证**：`go build ./...` + `go test ./internal/authz/ ./internal/chat/`（全绿，行为不变）。
 
-### Wave 2：RBAC 核心（决策三）
+### Wave 2：RBAC 核心（决策三）—— **已完成**（2026-09-26）
+
+**实现**：`internal/authz/rbac.go` 的 `RBACPermissions`（`User → Role → Permission`，
+含 RBAC1 角色继承 BFS 展开 + 环检测）。装配入口 `envRBAC()`（`TAIJI_RBAC` 环境变量），
+`resolvePermissions()` 统一入口——**RBAC 优先，未配时回退 `TAIJI_USER_PERMISSIONS`**
+（迁移期并存，避免现有部署静默失效）。
+
+**配置格式**（分号分隔条目，三类前缀）：
+```
+TAIJI_RBAC="role:admin=*;role:operator=mockmcp_echo,infraverse_*;parent:operator=viewer;user:ws1:feishu:ou_alice=admin"
+```
+
+**验证证据**：单测 `internal/authz/rbac_test.go` 13 例（直连/未授权/未绑定/空主体/
+空配置/单级继承/多级继承/环终止/通配/空动作/多角色并集/计数）+ `cmd/taiji/rbac_test.go`
+6 例（解析/继承/优先级/回退）。**反证验证**：禁用继承展开 → 继承测试变红（实测）。
 
 - 新增 `internal/authz/rbac.go`：`RBACPermissions` 实现 `PermissionSource`；
 - 三张表 + 继承展开 + 通配匹配（复用 `permission.go:107` `matchToolPattern`）；
@@ -525,6 +539,9 @@ PROBE-ANSWER "工具返回：[{\"type\":\"text\",\"text\":\"Echo: 你好\"}]"
 | `internal/authz/principal.go:129` | `IsOwner` |
 | `internal/authz/context.go:62` | `RequireWritable`（已有执行点：`ContextGuardPlugin`） |
 | `internal/authz/context_guard.go` | `ContextGuardPlugin`（上下文级降权的执行点，2026-09-26 新增） |
+| `internal/authz/rbac.go` | `RBACPermissions`（RBAC 实现，2026-09-26 新增） |
+| `cmd/taiji/main.go` `envRBAC` | RBAC 配置解析（`TAIJI_RBAC`） |
+| `cmd/taiji/main.go` `resolvePermissions` | 权限源统一入口（RBAC 优先，回退静态表） |
 | `cmd/taiji/serve_permissions.go` | `validateServePermissions`（serve 权限配置 fail-fast，2026-09-26 新增） |
 | `cmd/taiji/main.go` `buildPipeline` | serve 装配点（校验调用处） |
 | `internal/chat/chat.go:49` | `Options.Permissions` |

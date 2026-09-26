@@ -156,12 +156,12 @@ func runChat(args []string) int {
 	// 会让 CLI 的所有工具调用被拒（实测确认的静默失效）。
 	// Options.Permissions 的注释本就写明 CLI 属「nil」场景。
 	//
-	// 若用户设了该变量（误以为对 CLI 生效），显式提示而非静默忽略——
+	// 若用户设了任一权限变量（误以为对 CLI 生效），显式提示而非静默忽略——
 	// 否则「配了却不生效」又是一个静默缺口。
-	if envPermissions() != nil {
+	if envRBAC() != nil || envPermissions() != nil {
 		fmt.Fprintf(os.Stderr,
-			"taiji chat: 注意——TAIJI_USER_PERMISSIONS 对 CLI 无效"+
-				"（用户级权限按 IM 主体判定，CLI 无 IM 身份）。该变量仅 serve 生效。\n")
+			"taiji chat: 注意——用户级权限配置（TAIJI_RBAC / TAIJI_USER_PERMISSIONS）"+
+				"对 CLI 无效（权限按 IM 主体判定，CLI 无 IM 身份）。该配置仅 serve 生效。\n")
 	}
 
 	err = chat.Run(ctx, os.Stdin, chat.Options{
@@ -447,18 +447,22 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	// 与 CLI 不同，serve 面向多个 IM 用户，缺权限表 = 任何能触发 bot 的人
 	// 都能用所有已放行工具（安全边界消失）。故此处 fail-fast——
 	// 有工具但无决策时拒绝启动，而非运行期静默放行。
-	permissions := envPermissions()
+	permissions := resolvePermissions()
 	if permissions != nil {
-		if sp, ok := permissions.(*authz.StaticPermissions); ok {
-			logf("用户级权限已启用（%d 个主体）", sp.PrincipalCount())
-		} else {
+		switch sp := permissions.(type) {
+		case *authz.RBACPermissions:
+			logf("用户级权限已启用：RBAC（%d 个角色 / %d 个用户）",
+				sp.RoleCount(), sp.UserCount())
+		case *authz.StaticPermissions:
+			logf("用户级权限已启用：静态表（%d 个主体）", sp.PrincipalCount())
+		default:
 			logf("用户级权限已启用")
 		}
 		// 打印主体 ID 前缀——否则用户不知道 TAIJI_USER_PERMISSIONS 的
 		// key 该写什么（workspace 段有兜底值 default，不显眼且易漏）。
 		// 格式与 pipeline 注入时用的完全一致（同一 workspaceID()）。
-		logf("主体 ID 前缀：%s:feishu: —— TAIJI_USER_PERMISSIONS 的 key "+
-			"应写成 <该前缀><用户open_id>，如 %s:feishu:ou_xxx=工具名",
+		logf("主体 ID 前缀：%s:feishu: —— 配置的 key "+
+			"应写成 <该前缀><用户open_id>，如 %s:feishu:ou_xxx",
 			workspaceID(loaded), workspaceID(loaded))
 	} else if allowAllUsersFromEnv() {
 		logf("用户级权限：已按 %s=1 显式放开——任何能触发 bot 的用户"+
@@ -777,4 +781,96 @@ func envMaxToolIterations() int {
 		return defaultMaxToolIterations
 	}
 	return n
+}
+
+// envRBAC 从环境读 RBAC 配置（Wave 2——决策三）。
+//
+// 格式（分号分隔条目，等号分隔名与值）：
+//
+//	TAIJI_RBAC="role:admin=*;role:operator=mockmcp_echo,infraverse_*;user:ws1:feishu:ou_alice=admin;user:ws1:feishu:ou_bob=operator"
+//
+// 三类条目（前缀区分）：
+//   - role:<角色名>=<权限点列表>      定义角色 → 权限
+//   - parent:<子角色>=<父角色列表>     定义 RBAC1 继承
+//   - user:<主体ID>=<角色列表>        绑定用户 → 角色
+//
+// 主体 ID 形态为 {workspace}:{platform}:{open_id}（与 authz.ResolvePrincipal 一致）。
+// 权限点支持 "*" 与 "prefix_*" 通配（复用 matchToolPattern 语义）。
+//
+// 返回 nil 表示未配置——此时回退到 TAIJI_USER_PERMISSIONS（迁移期并存）。
+func envRBAC() authz.PermissionSource {
+	raw := strings.TrimSpace(os.Getenv("TAIJI_RBAC"))
+	if raw == "" {
+		return nil
+	}
+	roles := make(map[string][]string)
+	userRoles := make(map[string][]string)
+	roleParents := make(map[string][]string)
+
+	for _, entry := range strings.Split(raw, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue // 无 = 的条目跳过（不因一处笔误导致启动失败）
+		}
+		key = strings.TrimSpace(key)
+		items := splitCSV(value)
+		if len(items) == 0 {
+			continue
+		}
+
+		kind, name, ok := strings.Cut(key, ":")
+		if !ok {
+			continue // 无前缀的条目跳过
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+
+		switch strings.TrimSpace(kind) {
+		case "role":
+			roles[name] = items
+		case "parent":
+			roleParents[name] = items
+		case "user":
+			userRoles[name] = items
+		}
+	}
+
+	return authz.NewRBACPermissions(authz.RBACConfig{
+		Roles:       roles,
+		UserRoles:   userRoles,
+		RoleParents: roleParents,
+	})
+}
+
+// splitCSV 按逗号切分并去空白，丢弃空项。
+func splitCSV(v string) []string {
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// resolvePermissions 返回生效的用户级权限源。
+//
+// 优先级：TAIJI_RBAC（RBAC）> TAIJI_USER_PERMISSIONS（静态表）。
+// 两者都未配 → nil（不做用户级判定；serve 路径会因此拒绝启动，见
+// validateServePermissions）。
+//
+// 为什么并存而非替换：这是迁移期——现有部署可能已在用
+// TAIJI_USER_PERMISSIONS，直接替换会让它们静默失效（项目取向：
+// 静默失效最难排查）。RBAC 是更完整的模型，新部署应优先用它。
+func resolvePermissions() authz.PermissionSource {
+	if p := envRBAC(); p != nil {
+		return p
+	}
+	return envPermissions()
 }
