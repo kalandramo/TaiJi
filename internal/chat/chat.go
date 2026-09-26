@@ -58,6 +58,31 @@ type Options struct {
 	// （整段内容在 Message.Content 而非 Delta.Content）。
 	// 生产不应设置——原型默认走流式。
 	ForceNonStream bool
+
+	// MaxToolIterations 是单次执行允许的**工具调用轮次上限**。
+	//
+	// 用途：给「确定性拒绝」加协议层兜底——模型收到权限拒绝后可能反复
+	// 重试同一工具（实测见过连试 3 次），denyMessage 的「不要重试」只是
+	// 对模型的行为指令，无法在协议层强制（见 authz/permission_plugin.go）。
+	// 本上限是硬保障：轮次达上限即终止，不再发起 LLM 调用。
+	//
+	// 语义（对齐框架 llmagent.WithMaxToolIterations）：
+	//   - > 0：生效，每轮 invocation 计数
+	//   - <= 0：不限制（框架默认，保持既有行为）
+	//
+	// 计数与工具是否被执行**无关**（框架在权限检查前计数）——故被拒的
+	// 重试也计入，这正是能挡住死循环的原因。
+	MaxToolIterations int
+
+	// ToolIterationFinalization 是轮次达上限时的**优雅终结指令**。
+	//
+	// 空串表示使用框架默认文案（calllimit.DefaultInstruction）。
+	//
+	// 为什么需要它：不配 finalization 时，超限会 emit 一个 flow_error
+	// （"max tool iterations exceeded"），用户看到报错；配了则框架多做
+	// 一次**无工具**的最终模型调用，把已有信息汇总成回答——用户体验是
+	// 「得到答案」而非「报错」。
+	ToolIterationFinalization string
 }
 
 // logf 把日志写到 Echo（未设置则丢弃）。

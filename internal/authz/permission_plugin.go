@@ -112,8 +112,8 @@ func denyResult(msg string) *tool.BeforeToolResult {
 // 明确告知「不要重试」能让模型立即转向回答用户（如「请让管理员授权」）。
 //
 // 代价（明示）：这句话对模型是行为指令，无法在协议层强制。若模型
-// 仍重试，还有一层兜底——见 chat 层的工具调用轮次上限（当前未设，
-// 属已知缺口）。
+// 仍重试，还有一层兜底——chat 层的工具调用轮次上限
+// （Options.MaxToolIterations，默认 8；见 chat/execute.go 的 newAgent）。
 func denyMessage(toolName string) string {
 	return fmt.Sprintf(
 		"你没有使用该工具（%s）的权限。这是确定性拒绝，**重试不会成功**，"+

@@ -191,6 +191,17 @@ func newAgent(opts Options, m model.Model) (*llmagent.LLMAgent, error) {
 		// 从而避免多个 MCP server 的同名工具冲突（issue #3 AC-2）。
 		agentOpts = append(agentOpts, llmagent.WithToolSets(opts.ToolSets))
 	}
+	// 工具调用轮次上限：给「确定性拒绝」加协议层兜底（见 Options 注释）。
+	//
+	// 只在 >0 时配置——框架对 <=0 视为「无限制」，与「未配置」等价，
+	// 显式传入反而掩盖意图。
+	if opts.MaxToolIterations > 0 {
+		agentOpts = append(agentOpts,
+			llmagent.WithMaxToolIterations(opts.MaxToolIterations),
+			// 超限时做一次无工具的最终调用，优雅收尾（而非报 flow_error）。
+			llmagent.WithToolIterationLimitFinalization(opts.ToolIterationFinalization),
+		)
+	}
 	return llmagent.New("assistant", agentOpts...), nil
 }
 

@@ -1,7 +1,7 @@
 # Taiji · RBAC 权限体系接入设计
 
 > 项目：**taiji**（Go 原生 Agent Harness 原型）
-> 状态：**方案定稿（讨论产出）**，尚未落代码
+> 状态：**设计定稿；安全欠债（缺口 1/3/4）已修，RBAC 本体（Wave 1/2）待落代码**
 > 前置：`03-原型设计文档.md` §4.3 权限三层、`01-需求文档.md` FR-10.5~10.9
 > 参照系：`happyclaw/docs/ACL-MATRIX.md`（12 层权限矩阵，源码直读）
 
@@ -389,6 +389,32 @@ mockmcp 的 `echo` 声明 `readOnlyHint=true` 后读到 `readOnly=true`。
 - 接线断言：`buildPipeline` 确实调用校验（剥离注释后断言，反证有效）；
 - CLI 回归护栏 `cmd/taiji/chat_permissions_test.go`：`runChat` 不得传 `Permissions`；
 - **反证验证**：把校验改 no-op → 单测变红；移除调用 → 接线断言变红（两者均实测）。
+
+### 缺口 4：确定性拒绝无协议层兜底 —— **已修复**（2026-09-26）
+
+**原缺口**（此前只记录在 `internal/authz/permission_plugin.go:115` 的代码注释里，
+未收录进本文档——本次补录）：`denyMessage` 的「重试不会成功」只是对模型的
+**行为指令**，无法在协议层强制。模型若仍重试（实测见过连试 3 次），原本
+**没有轮次上限兜底**。
+
+**修复**：装配 `llmagent.WithMaxToolIterations` + `WithToolIterationLimitFinalization`：
+- 上限默认 **8**（`TAIJI_MAX_TOOL_ITERATIONS` 可配，`0` 显式关闭）；
+- 轮次达上限即终止，不再发起 LLM 调用——协议层硬保障；
+- finalization 让超限时做一次**无工具**的最终调用，把已有信息汇总成回答
+  （用户体验是「得到部分答案」而非「报 flow_error」）。
+
+**关键前提（代码级 + 运行时双重验证）**：被权限**拒绝**的工具调用**也计入**迭代——
+框架在权限检查前计数（`functioncall.go:320` 的 `IncToolIteration` 先于 `:342` 的
+`toolExecutionDecision`）。故上限能挡住「重试被拒工具」的死循环。
+
+**代价（明示）**：极长的合法工具链（>8 轮）会被截断——finalization 给出部分结果。
+确需更长链路可用环境变量调大。
+
+**验证证据**：
+- 探针实测：上限=3 → `modelCalls=4`（3 轮工具 + 1 次 finalization），病态重试被终止；
+- 单测 `internal/chat/max_tool_iterations_test.go`：3 例（病态重试被终止 / 优雅收尾 / 未设上限不干预）；
+- 单测 `cmd/taiji/max_tool_iterations_test.go`：5 例（默认值 / 显式值 / 0 关闭 / 非法值回退 / 双路径接线）；
+- **反证验证**：移除 `runChat` 接线 → 接线断言变红（实测）。
 
 ---
 

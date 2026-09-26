@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -169,9 +170,11 @@ func runChat(args []string) int {
 		ToolSets:    toolSets,
 		AllowTools:  append(envAllowTools(), allowTools...),
 		// Permissions 刻意不传：CLI 无 IM 身份，用户级权限不适用。
-		Out:   os.Stdout,
-		Echo:  os.Stderr,
-		Debug: *debug,
+		// 工具调用轮次上限：给确定性拒绝加协议层兜底（缺口 4）。
+		MaxToolIterations: envMaxToolIterations(),
+		Out:               os.Stdout,
+		Echo:              os.Stderr,
+		Debug:             *debug,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "taiji chat: %v\n", err)
@@ -488,7 +491,9 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 		ToolSets:    toolSets,
 		AllowTools:  allowTools,
 		Permissions: permissions,
-		Echo:        logw,
+		// 工具调用轮次上限：给确定性拒绝加协议层兜底（缺口 4）。
+		MaxToolIterations: envMaxToolIterations(),
+		Echo:              logw,
 	})
 	if err != nil {
 		bootstrap.CloseMCPSets(toolSets)
@@ -742,4 +747,34 @@ func envPermissions() authz.PermissionSource {
 		}
 	}
 	return authz.NewStaticPermissions(table)
+}
+
+// defaultMaxToolIterations 是工具调用轮次上限的默认值。
+//
+// 取值理由：正常的多步工具任务典型 2-4 轮，8 足够宽裕；而病态重试
+// （模型反复调用被拒工具）会在 8 轮内被终止。这个默认值是「缺口 4」
+// 真正修好的前提——不设默认等于缺口在新部署上依然敞开。
+//
+// 代价（明示）：极长的合法工具链（>8 轮）会被截断。此时 finalization
+// 会做一次无工具调用，把已有信息汇总成回答——用户得到的是「部分结果」
+// 而非错误。确需更长链路的部署可用 TAIJI_MAX_TOOL_ITERATIONS 调大。
+const defaultMaxToolIterations = 8
+
+// envMaxToolIterations 从环境读工具调用轮次上限。
+//
+//	TAIJI_MAX_TOOL_ITERATIONS=20   # 调大
+//	TAIJI_MAX_TOOL_ITERATIONS=0    # 显式关闭（不限制，退回框架默认行为）
+//
+// 未设时返回 defaultMaxToolIterations。非法值（非数字）也返回默认值——
+// 宁可保守也不因一处笔误让上限消失（fail-closed 取向）。
+func envMaxToolIterations() int {
+	v := strings.TrimSpace(os.Getenv("TAIJI_MAX_TOOL_ITERATIONS"))
+	if v == "" {
+		return defaultMaxToolIterations
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return defaultMaxToolIterations
+	}
+	return n
 }
