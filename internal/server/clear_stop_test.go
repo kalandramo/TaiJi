@@ -45,13 +45,13 @@ func (g *genSpy) Next(sessionID string) int {
 type sessionRecordingExecutor struct {
 	mu       sync.Mutex
 	sessions []string
-	inputs   []string
+	received []string
 }
 
 func (e *sessionRecordingExecutor) Execute(ctx context.Context, sessionID, input string) (string, error) {
 	e.mu.Lock()
 	e.sessions = append(e.sessions, sessionID)
-	e.inputs = append(e.inputs, input)
+	e.received = append(e.received, input)
 	e.mu.Unlock()
 	return "回答:" + input, nil
 }
@@ -64,6 +64,13 @@ func (e *sessionRecordingExecutor) sessionList() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]string(nil), e.sessions...)
+}
+
+// inputs 返回收到的输入（供验收测试断言「模型收到了什么」）。
+func (e *sessionRecordingExecutor) inputs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.received...)
 }
 
 // newClearPipeline 装配带 /clear 能力的管道。
