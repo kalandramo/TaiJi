@@ -404,8 +404,10 @@ user:<主体ID>=<角色名>            ← 用户 → 角色
 
 | 类型 | 形态 | 示例 |
 |---|---|---|
-| 工具权限 | **裸工具名** | `mockmcp_echo`、`Infraverse_*` |
+| 工具权限 | **裸工具名**（`{server名}_{远端名}`） | `Infraverse_infraverse_dce_ip`、`Infraverse_*` |
 | 命令权限 | **`cmd:` 前缀** | `cmd:help`、`cmd:status`、`cmd:clear`、`cmd:stop` |
+
+**工具名的实际值从启动日志取**（`模型可见的工具名：[...]`），不要凭猜。
 
 **为什么命令要加前缀**：MCP 工具名自带 `{server}_` 前缀（天然命名空间），
 命令名（`help`）没有——必须显式加前缀才能与工具名区分。
@@ -414,19 +416,38 @@ user:<主体ID>=<角色名>            ← 用户 → 角色
 
 ### 8.4 配置示例
 
-**最省事**（一条通吃）：
+> **先看你自己的工具名**：本文档示例用 `mockmcp_echo`——那是测试夹具
+> （`testdata/mockmcp`）的名字，**不是你的真实工具**。照抄会导致工具被拒。
+>
+> 你的工具名从启动日志取：
+>
+> ```
+> [pipeline] 模型可见的工具名：[Infraverse_infraverse_dce_ip]
+> [pipeline] 工具策略：默认拒绝，放行 [Infraverse_infraverse_dce_ip]
+> ```
+>
+> 工具名格式是 `{server名}_{远端工具名}`（大小写敏感），来自 `TAIJI_ALLOW_TOOLS`。
+
+**最省事**（一条通吃工具与命令）：
 
 ```
 TAIJI_RBAC="role:admin=*;user:default:feishu:ou_xxxxx=admin"
 ```
 
+`*` 同时匹配工具名与 `cmd:*`。
+
 **精细控制**（推荐，权限边界清晰）：
 
 ```
-TAIJI_RBAC="role:viewer=cmd:help,cmd:status;role:operator=cmd:help,cmd:status,cmd:clear,cmd:stop,mockmcp_echo;parent:operator=viewer;user:default:feishu:ou_xxxxx=operator"
+TAIJI_RBAC="role:viewer=cmd:help,cmd:status;role:operator=cmd:help,cmd:status,cmd:clear,cmd:stop,<你的工具名前缀>_*;parent:operator=viewer;user:default:feishu:ou_xxxxx=operator"
 ```
 
-效果：`viewer` 只能看帮助与状态；`operator` 继承 viewer 并多出 `clear`/`stop`/`mockmcp_echo`。
+把 `<你的工具名前缀>` 换成实际 server 名（如 `Infraverse`）。
+效果：`viewer` 只能看帮助与状态；`operator` 继承 viewer 并多出 `clear`/`stop`/工具权限。
+
+> **前缀通配必须带下划线**：`Infraverse_*` 匹配 `Infraverse_infraverse_dce_ip`，
+> 但 `Infraverse`（无 `_*`）**不匹配**——它被当作精确名字。
+> 实测证据见 §8.6 坑 4。
 
 ### 8.5 可用命令与所需权限点
 
@@ -441,7 +462,7 @@ TAIJI_RBAC="role:viewer=cmd:help,cmd:status;role:operator=cmd:help,cmd:status,cm
 - RBAC 管「这个用户能做什么动作」
 - owner 管「这个资源属于谁」——由 `TAIJI_FEISHU_OWNERS` 配置
 
-### 8.6 三个容易踩的坑
+### 8.6 四个容易踩的坑
 
 **坑 1：配了 RBAC 后 `TAIJI_USER_PERMISSIONS` 失效。**
 不是合并，是替换。若原来靠它放行工具，必须把工具权限也写进 RBAC 的 role 列表。
@@ -460,6 +481,43 @@ TAIJI_RBAC 配置错误：RBAC 配置有 1 处未定义角色引用：
 **坑 3：`cmd:` 权限点必须显式列出。**
 `role:admin=mockmcp_echo,Infraverse_*` 只放行工具——命令仍全部被拒。
 要么用 `*`，要么显式加 `cmd:help` 等。
+
+**坑 4：工具名写错 → 工具被拒（命令却能正常执行）。**
+
+这是**最容易误判**的一种：命令系统与工具权限是两条独立链路，
+工具名配错时**命令照常工作**，只有调工具才失败。
+
+实测症状（2026-09-26 真实飞书对话）：
+
+```
+[pipeline] server: command executed name=help    ← 命令成功
+[pipeline] server: command executed name=status  ← 命令成功
+[perm] denied: not permitted (principal=default:feishu:a701f26e tool=Infraverse_infraverse_dce_ip resource="default")
+                                                    ↑ 工具被拒
+```
+
+**根因**：RBAC 里写的是 `mockmcp_echo`（文档示例/测试夹具名），
+而实际工具名是 `Infraverse_infraverse_dce_ip`。
+
+**排查方法**：对比「启动日志的工具名」与「RBAC 里配的名字」。
+启动日志会打印：
+
+```
+[pipeline] 模型可见的工具名：[Infraverse_infraverse_dce_ip]
+```
+
+**匹配规则实测**（`matchToolPattern`）：
+
+| 配置的模式 | 对 `Infraverse_infraverse_dce_ip` | 结果 |
+|---|---|---|
+| `Infraverse_*` | 前缀匹配 | ✅ 放行 |
+| `Infraverse_infraverse_dce_ip` | 精确匹配 | ✅ 放行 |
+| `*` | 通配一切 | ✅ 放行 |
+| `Infraverse` | **无 `_*`，按精确名处理** | ❌ 拒绝 |
+| `mockmcp_echo` | 完全不同的名字 | ❌ 拒绝 |
+
+> **前缀通配必须写 `_*`**：`Infraverse_*` 对，`Infraverse` 错。
+> 后者被当作精确工具名，永远匹配不上。
 
 ### 8.7 `TAIJI_ALLOW_ALL_USERS`
 
