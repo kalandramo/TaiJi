@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/kalandramo/TaiJi/internal/authz"
@@ -111,6 +112,16 @@ type Config struct {
 	//
 	// nil 表示 /clear 不可用（Handler 会返回错误）。
 	SessionGen SessionGenFunc
+
+	// Cancels 是 /stop 的取消注册表（SPEC §5.4）。
+	//
+	// **由装配方创建并注入**，而非管道内部创建——理由：
+	// 命令的 Handler 在注册时就需要它（cmd.Deps.CancelRun），
+	// 而注册发生在 server.New 之前。若管道内部创建，装配方
+	// 只能事后回填（`rebindCancel`），那是个别扭的两阶段初始化。
+	//
+	// nil 表示管道内部创建一个（向后兼容：既有测试夹具无需改动）。
+	Cancels *CancelRegistry
 }
 
 // SessionGenFunc 是会话代数的管理面（/clear 的基础设施）。
@@ -186,6 +197,12 @@ func New(cfg Config) (*Pipeline, error) {
 	if placeholder == "" {
 		placeholder = DefaultPlaceholder
 	}
+	// Cancels 可注入（装配方与命令 Handler 共享同一实例）；
+	// 未注入时内部创建（既有测试夹具无需改动）。
+	cancels := cfg.Cancels
+	if cancels == nil {
+		cancels = NewCancelRegistry()
+	}
 	return &Pipeline{
 		sender:      cfg.Sender,
 		executor:    cfg.Executor,
@@ -198,11 +215,14 @@ func New(cfg Config) (*Pipeline, error) {
 		permissions: cfg.Permissions,
 		ownerCheck:  cfg.OwnerCheck,
 		sessionGen:  cfg.SessionGen,
-		cancels:     NewCancelRegistry(),
+		cancels:     cancels,
 	}, nil
 }
 
-// CancelRegistry 返回 /stop 使用的取消注册表（供外部观测，如测试）。
+// CancelRegistry 返回 /stop 使用的取消注册表。
+//
+// 装配方用它构造 cmd.Deps.CancelRun——两处必须指向**同一实例**，
+// 否则 /stop 取消的是另一个注册表里的 run（静默失效）。
 func (p *Pipeline) CancelRegistry() *CancelRegistry { return p.cancels }
 
 // Handle 处理一条入站消息。
@@ -328,7 +348,37 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 	// **卡片是增强，不是依赖**：任何一步失败都降级到 B，用户始终能得到回答。
 	// 设计文档 §4.4 定义了降级矩阵。
 	receiver, idType := receiverOf(msg)
-	return p.deliverAnswer(runCtx, target.EffectiveJID, msg, receiver, idType)
+
+	// 会话代数作用域（SPEC §11.1.2）：/clear 递增代数后，后续消息
+	// 必须用**带代数后缀的 sessionID** 才能与旧历史隔离。
+	//
+	// 为什么在管道侧而非 main 侧：sessionID 由路由产生（target.EffectiveJID），
+	// 只有管道知道它。main 只提供代数计数（SessionGenFunc）。
+	//
+	// 若漏掉这一步，/clear 会是**空操作**——用户看到「已开始新会话」
+	// 但历史仍参与后续对话（假功能）。
+	sessionID := p.scopedSessionID(target.EffectiveJID)
+
+	return p.deliverAnswer(runCtx, sessionID, msg, receiver, idType)
+}
+
+// scopedSessionID 把会话代数叠到 sessionID 上（SPEC §11.1.2）。
+//
+// 格式：`{base}#gen:{n}`——n=0（未 /clear 过）时**不加后缀**，
+// 保持既有行为完全不变（向后兼容：既有测试断言 sessionID == EffectiveJID）。
+//
+// 为什么用后缀：会话标识形如 `{channel}:{workspace}#{local}`
+// （channel/router.go 的 base 构造）。后缀追加不破坏前缀解析
+// （串行化键派生是纯字符串解析，零 IO）。
+func (p *Pipeline) scopedSessionID(base string) string {
+	if p.sessionGen == nil {
+		return base
+	}
+	gen := p.sessionGen.Current(base)
+	if gen <= 0 {
+		return base
+	}
+	return base + "#gen:" + strconv.Itoa(gen)
 }
 
 // handleCommand 处理一条命令（SPEC §5.1）。

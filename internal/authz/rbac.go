@@ -76,9 +76,9 @@ func NewRBACPermissions(cfg RBACConfig) *RBACPermissions {
 // 继承用 BFS + visited 防环——配置里出现环（a→b→a）时必须终止，
 // 否则判定会死循环。visited 同时完成去重。
 func collectPermissions(roles []string, rolePerms, roleParents map[string][]string) []string {
-	seen := make(map[string]bool)   // 已访问的角色（防环）
-	perms := make(map[string]bool)  // 已收集的权限点（去重）
-	var order []string              // 保持稳定顺序（便于测试与日志）
+	seen := make(map[string]bool)  // 已访问的角色（防环）
+	perms := make(map[string]bool) // 已收集的权限点（去重）
+	var order []string             // 保持稳定顺序（便于测试与日志）
 
 	queue := make([]string, 0, len(roles))
 	for _, r := range roles {

@@ -24,6 +24,7 @@ import (
 	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
 	"github.com/kalandramo/TaiJi/internal/channel"
+	"github.com/kalandramo/TaiJi/internal/channel/cmd"
 	"github.com/kalandramo/TaiJi/internal/channel/feishu"
 	"github.com/kalandramo/TaiJi/internal/chat"
 	"github.com/kalandramo/TaiJi/internal/config"
@@ -537,21 +538,54 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 		}
 	}
 
+	// 命令系统装配（SPEC P5）。
+	//
+	// 装配顺序的关键：CancelRegistry 必须**先创建**，再同时传给
+	// cmd.Deps（/stop 的 Handler 用）与 server.Config（管道执行 run 时用）。
+	// 两者必须是**同一实例**——否则 /stop 取消的是另一个注册表里的 run。
+	gateCfg := gateConfigFromEnv()
+	wsID := workspaceID(loaded)
+	cancels := server.NewCancelRegistry()
+	sessionGens := newSessionGenerations()
+
+	cmdRegistry := cmd.NewRegistry()
+	cmd.RegisterBuiltins(cmdRegistry, cmd.Deps{
+		ClearSession: sessionGens.Next,
+		CancelRun:    cancels.Cancel,
+	})
+
 	p, err := server.New(server.Config{
 		Sender:   sender,
 		Executor: executor,
-		Gate:     gateConfigFromEnv(),
+		Gate:     gateCfg,
 		Route: channel.RouteConfig{
-			WorkspaceID: workspaceID(loaded),
+			WorkspaceID: wsID,
 			// 群聊按话题分流（§4.4.4 的 thread_map）；单聊无话题概念。
 			BindingMode: channel.BindingThreadMap,
 		},
 		Logf: logf,
+		// ── 命令系统 ──
+		Commands:    cmdRegistry,
+		Permissions: permissions,
+		// owner 判定复用门禁的 owner 列表（authz.IsOwner 是纯函数比对）。
+		OwnerCheck: func(openID string) bool {
+			return authz.IsOwner(gateCfg.Owners, openID)
+		},
+		SessionGen: sessionGens,
+		Cancels:    cancels,
 	})
 	if err != nil {
 		executor.Close()
 		bootstrap.CloseMCPSets(toolSets)
 		return nil, err
+	}
+
+	logf("命令系统已装配：%v", cmdRegistry.Names())
+	if permissions != nil {
+		logf("命令权限点形如 cmd:help、cmd:stop——" +
+			"在 TAIJI_RBAC 的 role 权限列表里加上它们即可放行")
+	} else {
+		logf("警告：未配用户级权限源，命令将全部被拒（fail-closed）")
 	}
 	return &pipelineHolder{Pipeline: p, executor: executor}, nil
 }
