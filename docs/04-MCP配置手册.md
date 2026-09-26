@@ -321,7 +321,7 @@ reg delete HKCU\Environment /F /V TAIJI_MCP_SERVERS
 
 ## 7. 环境变量总表
 
-代码中出现的全部 `TAIJI_` 变量（12 项，来自 `grep -rhno "TAIJI_[A-Z_]*"`）：
+代码中出现的全部 `TAIJI_` 变量（16 项，来自 `grep -rhno "TAIJI_[A-Z_]*" --include=*.go cmd/ internal/` 去重）：
 
 | 变量 | 用途 | 类别 |
 |---|---|---|
@@ -336,14 +336,148 @@ reg delete HKCU\Environment /F /V TAIJI_MCP_SERVERS
 | `TAIJI_FEISHU_ACTIVATION` | 触发模式（`always` / `disabled`） | 渠道 |
 | `TAIJI_FEISHU_AUDIENCE` | 受众（`owner_only` 等） | 渠道 |
 | `TAIJI_FEISHU_OWNERS` | owner 列表（逗号分隔） | 渠道 |
+| **`TAIJI_RBAC`** | **用户级权限（RBAC，推荐）** | **权限** |
+| **`TAIJI_USER_PERMISSIONS`** | **用户级权限（静态表，旧格式）** | **权限** |
+| **`TAIJI_ALLOW_ALL_USERS`** | **显式声明放开用户级管控** | **权限** |
+| **`TAIJI_MAX_TOOL_ITERATIONS`** | **工具调用轮次上限（默认 8，`0` 关闭）** | **模型** |
 
 非 `TAIJI_` 前缀的渠道凭据（`FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_VERIFICATION_TOKEN`、`FEISHU_ENCRYPT_KEY`）见 `internal/config/guard.go` 的 `CredentialKeys`。
 
 **注意**：`TAIJI_MODEL_BASE_URL` 必须自带 `/v1` 路径段——SDK 的拼接方式是 `BaseURL + /chat/completions`（`github.com/openai/openai-go@v1.12.0/internal/requestconfig/requestconfig.go:387`）。
 
+> **本节曾漏 4 项**（2026-09-26 修正）：`TAIJI_RBAC`、`TAIJI_USER_PERMISSIONS`、
+> `TAIJI_ALLOW_ALL_USERS`、`TAIJI_MAX_TOOL_ITERATIONS`。原因是最初版本按
+> 「MCP 配置」的视角写，把权限类变量当成了别处的话题。但「环境变量总表」
+> 若不全就失去索引价值——用户会以为这些变量不存在。详见 §8。
+
 ---
 
-## 8. 已知边界
+## 8. 权限配置（RBAC）
+
+> **本节新增（2026-09-26）**。此前手册只讲 MCP，权限话题分散在
+> `07-RBAC权限设计.md`（设计）与 `08-命令系统与RBAC需求文档.md`（需求）。
+> 但对**配置者**而言，「该设哪些环境变量」才是他要的答案。
+
+### 8.1 两个变量的关系：**二选一，不是合并**
+
+`TAIJI_RBAC` 与 `TAIJI_USER_PERMISSIONS` 都提供用户级权限，但**优先级是排他的**：
+
+```mermaid
+flowchart TD
+    A["启动装配"] --> B{"TAIJI_RBAC 配了吗?"}
+    B -->|是| C["用 RBAC<br/>TAIJI_USER_PERMISSIONS 被**忽略**"]
+    B -->|否| D["用静态表<br/>TAIJI_USER_PERMISSIONS"]
+    C --> E["命令权限点 cmd:xxx 可用"]
+    D --> F["命令全部被拒<br/>（静态表无 cmd: 条目）"]
+
+    style C fill:#2d4a3a,stroke:#4a7,color:#fff
+    style D fill:#4a3a2d,stroke:#a74,color:#fff
+    style F fill:#4a2d2d,stroke:#a44,color:#fff
+```
+
+代码依据：`cmd/taiji/main.go` 的 `resolvePermissions()`——RBAC 优先，
+未配才回退静态表。
+
+**实测证据**（2026-09-26，用真实二进制启动对比）：
+
+| 配置 | 启动日志 |
+|---|---|
+| 只配 `TAIJI_USER_PERMISSIONS` | `用户级权限已启用：静态表（1 个主体）` |
+| 两者都配 | `用户级权限已启用：RBAC（1 个角色 / 1 个用户）` |
+
+### 8.2 `TAIJI_RBAC` 语法
+
+三类前缀，分号分隔条目：
+
+```
+role:<角色名>=<权限点列表>        ← 角色 → 权限
+parent:<子角色>=<父角色>          ← 可选，角色继承（子角色获得父角色权限）
+user:<主体ID>=<角色名>            ← 用户 → 角色
+```
+
+**主体 ID 格式**：`{workspace}:{platform}:{open_id}`
+
+- `workspace` 来自 `TAIJI_WORKSPACE_ID`，未配时为 `default`
+- 启动日志会打印前缀提示，可照着抄
+
+### 8.3 权限点形态
+
+| 类型 | 形态 | 示例 |
+|---|---|---|
+| 工具权限 | **裸工具名** | `mockmcp_echo`、`Infraverse_*` |
+| 命令权限 | **`cmd:` 前缀** | `cmd:help`、`cmd:status`、`cmd:clear`、`cmd:stop` |
+
+**为什么命令要加前缀**：MCP 工具名自带 `{server}_` 前缀（天然命名空间），
+命令名（`help`）没有——必须显式加前缀才能与工具名区分。
+
+支持通配：`*`（全部）、`前缀*`（前缀匹配）。`*` 同时覆盖工具与命令。
+
+### 8.4 配置示例
+
+**最省事**（一条通吃）：
+
+```
+TAIJI_RBAC="role:admin=*;user:default:feishu:ou_xxxxx=admin"
+```
+
+**精细控制**（推荐，权限边界清晰）：
+
+```
+TAIJI_RBAC="role:viewer=cmd:help,cmd:status;role:operator=cmd:help,cmd:status,cmd:clear,cmd:stop,mockmcp_echo;parent:operator=viewer;user:default:feishu:ou_xxxxx=operator"
+```
+
+效果：`viewer` 只能看帮助与状态；`operator` 继承 viewer 并多出 `clear`/`stop`/`mockmcp_echo`。
+
+### 8.5 可用命令与所需权限点
+
+| 命令 | 权限点 | 是否需 owner |
+|---|---|---|
+| `/help` | `cmd:help` | 否 |
+| `/status` | `cmd:status` | 否 |
+| `/clear` | `cmd:clear` | **是** |
+| `/stop` | `cmd:stop` | **是** |
+
+**owner 判定与 RBAC 是正交的两个维度**（都要过）：
+- RBAC 管「这个用户能做什么动作」
+- owner 管「这个资源属于谁」——由 `TAIJI_FEISHU_OWNERS` 配置
+
+### 8.6 三个容易踩的坑
+
+**坑 1：配了 RBAC 后 `TAIJI_USER_PERMISSIONS` 失效。**
+不是合并，是替换。若原来靠它放行工具，必须把工具权限也写进 RBAC 的 role 列表。
+
+**坑 2：角色名拼错会导致启动失败**（这是设计，不是 bug）。
+`RBACConfig.Validate` 检查所有被引用的角色是否已定义，未定义则拒绝启动并列出全部错误：
+
+```
+TAIJI_RBAC 配置错误：RBAC 配置有 1 处未定义角色引用：
+  - user "default:feishu:ou_xxx" 引用了未定义的角色 "operater"
+```
+
+**为什么刻意 fail-fast**：否则该用户会被**静默拒绝**（权限为空），
+排查成本远高于启动时报错。
+
+**坑 3：`cmd:` 权限点必须显式列出。**
+`role:admin=mockmcp_echo,Infraverse_*` 只放行工具——命令仍全部被拒。
+要么用 `*`，要么显式加 `cmd:help` 等。
+
+### 8.7 `TAIJI_ALLOW_ALL_USERS`
+
+单用户部署或纯只读工具部署时，可用它**显式声明**放开用户级管控：
+
+```
+TAIJI_ALLOW_ALL_USERS=1
+```
+
+**为什么需要显式声明**：否则「忘了配权限」与「有意放开」在系统里无法区分。
+该开关让「放开」成为一个决策而非遗漏。
+
+> **前提**：`serve` 路径有启动期校验——若挂了工具但既没配权限表
+> 也没设此开关，**拒绝启动**（`cmd/taiji/serve_permissions.go`）。
+
+---
+
+## 9. 已知边界
 
 | 项 | 说明 |
 |---|---|
