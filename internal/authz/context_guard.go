@@ -42,10 +42,31 @@ type ContextGuardPlugin struct {
 //	skill_list_docs    被拒=true
 //	skill_select_docs  被拒=true
 //
-// 但三者**事实只读**：
-//   - skill_load        把 SKILL.md 正文读进模型上下文
-//   - skill_list_docs   列出 skill 的文档
-//   - skill_select_docs 只改**会话内**的文档选择状态（读 ctx，无外部副作用）
+// 但三者**事实只读**。判定判据是**写的作用域**，不是「是否写任何状态」：
+//
+//	工具                 写什么（若有）        作用域        判定
+//	skill_load           temp:skill:loaded:*   本会话临时态   只读
+//	skill_list_docs      （不写）              —             只读
+//	skill_select_docs    temp:skill:docs:*     本会话临时态   只读
+//	skill_run/skill_exec 执行进程 / 写文件      **外部世界**  写
+//
+// **为什么「写 temp: 状态」不算写操作**：TaiJi 的 ReadOnly 语义是
+// 「**无外部副作用**」而非「不写任何内存状态」——见 context.go 的动机注释：
+// 上下文级降权防的是「IM 用户借 bot 改动外部世界」，不是禁止会话内状态流转。
+// 三条证据：
+//  1. 键前缀 `temp:`（trpc-agent-go/skill/repository.go:534-535）——
+//     上游显式标记为**临时会话态**。
+//  2. 键不含外部资源标识——`DocsKey(agentName, skillName)` 只有 agent 与
+//     skill 名，无路径/无凭据/无对外句柄。
+//  3. `Call` 内无 fs/net 调用（select_docs.go 的 Call 只读 ctx 并返回结果
+//     对象；repo 仅用于 `GetForContext` 校验 skill 名存在）。
+//  4. 存储本体是 inmemory（execute.go:49 注释：runner.go:390 默认
+//     inmemory），随进程退出消失。
+//
+// **初版注释这里是错的**（2026-09-26 自查修正）：曾写「skill_load 只读、
+// skill_select_docs 只改会话态」——实测两个**都**写 StateDelta
+// （load.go:187 写 LoadedKey，select_docs.go:170 写 DocsKey）。
+// 「谁写状态」不是判据，「写到哪个作用域」才是。
 //
 // **为什么不用前缀匹配**：同一家族的 skill_run / skill_exec /
 // skill_write_stdin / skill_poll_session / skill_kill_session 是**真写操作**
