@@ -83,6 +83,29 @@ type Options struct {
 	// 一次**无工具**的最终模型调用，把已有信息汇总成回答——用户体验是
 	// 「得到答案」而非「报错」。
 	ToolIterationFinalization string
+
+	// SkillRoot 是 skill 仓库根目录（可含多个，用 os.PathListSeparator 分隔）。
+	//
+	// 格式约定同上游 skill.FSRepository：每个子目录含一个 SKILL.md，
+	// 带可选 YAML front matter（name/description）。缺 name 时回落为目录名。
+	//
+	// 空串表示不启用 skill——此时装配路径与既有行为**完全一致**（回归护栏）。
+	//
+	// 为什么收路径而非 skill.Repository：本包不 import skill 包，保持
+	// 「不依赖具体能力实现」的定位（与 cmd 包不 import authz 同构）。
+	// 仓库构造与失败处理在装配期本包内完成。
+	SkillRoot string
+
+	// SkillToolProfile 控制启用哪些上游 skill 工具。
+	//
+	// 空串 → 用上游默认（KnowledgeOnly：只注册 skill_load /
+	// skill_list_docs / skill_select_docs，不含执行类工具）。
+	//
+	// 为什么默认 KnowledgeOnly 而非 Full：Full 会注册 skill_run /
+	// skill_exec 等**代码执行**工具。本项目 serve 面向 IM 用户，
+	// 且 IM 来源是只读上下文（§4.3.3）——执行工具的语义与此冲突。
+	// 需要执行能力时应显式配置，并自行评估沙箱。
+	SkillToolProfile string
 }
 
 // logf 把日志写到 Echo（未设置则丢弃）。

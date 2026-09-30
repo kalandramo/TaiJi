@@ -31,7 +31,46 @@ type ContextGuardPlugin struct {
 	logf func(format string, args ...any)
 }
 
+// skillReadOnlyTools 是**上游漏标 ReadOnly 的 skill 读类工具**修正名单。
+//
+// 为什么需要它（实测确认，2026-09-26）：
+// 上游 trpc-agent-go v1.11.2 的 skill 工具**未实现 tool.MetadataProvider**
+// （`grep -rln ToolMetadata` 对 `tool/skill/` 返回空），故 `tool.MetadataOf`
+// 返回零值 → `ReadOnly=false`。实测 `KindChannel` 下：
+//
+//	skill_load         被拒=true   ← "write tool in non-writable context"
+//	skill_list_docs    被拒=true
+//	skill_select_docs  被拒=true
+//
+// 但三者**事实只读**：
+//   - skill_load        把 SKILL.md 正文读进模型上下文
+//   - skill_list_docs   列出 skill 的文档
+//   - skill_select_docs 只改**会话内**的文档选择状态（读 ctx，无外部副作用）
+//
+// **为什么不用前缀匹配**：同一家族的 skill_run / skill_exec /
+// skill_write_stdin / skill_poll_session / skill_kill_session 是**真写操作**
+// （执行代码、写 stdin）。若按 `skill_` 前缀放行，切到
+// `SkillToolProfileFull` 时会把这些一并放行——**开的洞比要修的问题更大**。
+// 故必须**精确名**逐个列出。
+//
+// **上游修好后应复查本名单**：若将来 `tool/skill/` 实现了 MetadataProvider
+// 并正确标注 ReadOnly，此名单即冗余（保留无害——只在注解缺失时生效，
+// 不会覆盖上游的显式声明）。
+var skillReadOnlyTools = map[string]struct{}{
+	"skill_load":        {},
+	"skill_list_docs":   {},
+	"skill_select_docs": {},
+}
+
+// isSkillReadOnlyOverride 判断工具名是否在 skill 只读修正名单中。
+func isSkillReadOnlyOverride(name string) bool {
+	_, ok := skillReadOnlyTools[name]
+	return ok
+}
+
 // NewContextGuardPlugin 用工具集构造守卫。
+//
+// tools 为 nil 时 readOnly 表为空 → 所有工具视为写操作（fail-closed）。
 //
 // tools 为 nil 时 readOnly 表为空 → 所有工具视为写操作（fail-closed）。
 func NewContextGuardPlugin(tools []tool.Tool, logf func(string, ...any)) *ContextGuardPlugin {
@@ -44,7 +83,13 @@ func NewContextGuardPlugin(tools []tool.Tool, logf func(string, ...any)) *Contex
 		if d == nil || d.Name == "" {
 			continue
 		}
-		readOnly[d.Name] = tool.MetadataOf(t).ReadOnly
+		// 上游注解优先；注解缺失（false）时，skill 读类工具由
+		// skillReadOnlyTools 修正为只读（见该变量注释）。
+		ro := tool.MetadataOf(t).ReadOnly
+		if !ro && isSkillReadOnlyOverride(d.Name) {
+			ro = true
+		}
+		readOnly[d.Name] = ro
 	}
 	return &ContextGuardPlugin{readOnly: readOnly, logf: logf}
 }

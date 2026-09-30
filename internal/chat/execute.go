@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/plugin"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
+	"trpc.group/trpc-go/trpc-agent-go/skill"
 
 	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
@@ -185,6 +187,37 @@ func newAgent(opts Options, m model.Model) (*llmagent.LLMAgent, error) {
 	if s := strings.TrimSpace(opts.Instruction); s != "" {
 		agentOpts = append(agentOpts, llmagent.WithInstruction(s))
 	}
+	// skill 支持（方案 A：全量复用上游）。
+	//
+	// 装配失败即返回 error（而非降级为「无 skill」）——配置了 skill 却静默
+	// 不生效是最难排查的一类问题（与项目既有取向一致：TAIJI_RBAC 引用
+	// 未定义角色也是 fail-fast）。
+	//
+	// 注意：skill 工具会进入 ag.Tools()，因而被部署级白名单
+	// （TAIJI_ALLOW_TOOLS）与上下文级守卫（ContextGuardPlugin）管辖。
+	// 前者要求显式放行（见 main.go 的装配提示）；后者对**读类** skill 工具
+	// 有精确名修正（见 authz.skillReadOnlyTools——上游未标 ReadOnly）。
+	if root := strings.TrimSpace(opts.SkillRoot); root != "" {
+		repo, err := newSkillRepository(root)
+		if err != nil {
+			return nil, err
+		}
+		agentOpts = append(agentOpts,
+			llmagent.WithSkills(repo),
+			// **必须显式传 profile**（实测发现，2026-09-26）：
+			// 不传时上游注册 6 个工具，其中含 workspace_exec /
+			// workspace_write_stdin / workspace_kill_session——
+			// **能执行代码**。实测对比：
+			//
+			//	不传 profile   (6): + workspace_exec 等 3 个执行类
+			//	KnowledgeOnly  (3): 仅 skill_load / skill_select_docs / skill_list_docs
+			//	Full          (11): 再加 skill_run / skill_exec 等
+			//
+			// 这与「serve 面向 IM 用户 + IM 来源只读」的定位冲突，
+			// 故默认取最小权限档位。
+			llmagent.WithSkillToolProfile(skillToolProfile(opts.SkillToolProfile)),
+		)
+	}
 	if len(opts.ToolSets) > 0 {
 		// 挂载工具集：llmagent 会用 NamedToolSet 包装，把工具名变成
 		// {toolSetName}_{originalName}（见 trpc internal/tool/toolset.go:251），
@@ -348,4 +381,51 @@ func runOneTurn(ctx context.Context, r runner.Runner, opts Options, sessionID, i
 		fmt.Fprintf(opts.Echo, "\n[debug] 本轮输出 %d 字节\n", printed)
 	}
 	return nil
+}
+
+// newSkillRepository 按路径构造 skill 仓库。
+//
+// root 可含多个根，用 os.PathListSeparator 分隔（Windows ';'，类 Unix ':'）——
+// 与上游 skill.NewFSRepository 的可变参数语义对应。
+//
+// 为什么包装 error：路径写错或目录不存在时，上游的 error 文本不含
+// 「这是 skill 配置」的语境，用户看到会以为是别的问题。
+func newSkillRepository(root string) (skill.Repository, error) {
+	parts := strings.Split(root, string(os.PathListSeparator))
+	kept := make([]string, 0, len(parts))
+	for _, r := range parts {
+		if r = strings.TrimSpace(r); r != "" {
+			kept = append(kept, r)
+		}
+	}
+	if len(kept) == 0 {
+		return nil, errors.New("chat: SkillRoot 未提供有效路径")
+	}
+	repo, err := skill.NewFSRepository(kept...)
+	if err != nil {
+		return nil, fmt.Errorf("chat: 构造 skill 仓库（root=%v）: %w", kept, err)
+	}
+	return repo, nil
+}
+
+// skillToolProfile 解析 skill 工具档位，默认取最小权限档 KnowledgeOnly。
+//
+// 为什么默认不是上游默认（空串不传）：实测（2026-09-26）显示不传 profile
+// 时上游注册 6 个工具，含 workspace_exec / workspace_write_stdin /
+// workspace_kill_session——**能执行代码**。而 TaiJi 的 serve 面向 IM 用户、
+// IM 来源又是只读上下文（§4.3.3），执行类工具与之语义冲突。
+//
+// 识别的取值（不区分大小写）：
+//   - ""/"knowledge-only"/"knowledgeonly" → KnowledgeOnly（默认，只读类）
+//   - "full"                              → Full（含执行类，需自行评估沙箱）
+//   - 其他                                → 按上游字面量透传（上游会校验）
+func skillToolProfile(v string) llmagent.SkillToolProfile {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "knowledge-only", "knowledgeonly":
+		return llmagent.SkillToolProfileKnowledgeOnly
+	case "full":
+		return llmagent.SkillToolProfileFull
+	default:
+		return llmagent.SkillToolProfile(strings.TrimSpace(v))
+	}
 }

@@ -514,7 +514,13 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 		Permissions: permissions,
 		// 工具调用轮次上限：给确定性拒绝加协议层兜底（缺口 4）。
 		MaxToolIterations: envMaxToolIterations(),
-		Echo:              logw,
+		// 系统提示（2026-09-26 补）：serve 此前**完全没有**这条通道——
+		// CLI 有 -instruction flag，serve 只能靠框架默认 instruction。
+		// skill 的静态摘要也由此进入模型上下文。
+		Instruction:      envInstruction(),
+		SkillRoot:        envSkillRoot(),
+		SkillToolProfile: envSkillToolProfile(),
+		Echo:             logw,
 	})
 	if err != nil {
 		bootstrap.CloseMCPSets(toolSets)
@@ -532,16 +538,39 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	// 装配成功后才打印生效状态——放在 NewExecutor **之后**，
 	// 否则白名单校验失败时会先打印「放行 [...]」再报错，误导为成功。
 	logf("MCP server 已装配：%v", serverNames(mcpCfgs))
-	if len(toolSets) > 0 {
-		registered := executor.RegisteredTools()
-		if len(registered) > 0 {
-			logf("模型可见的工具名：%v", registered)
+	// 工具面提示**不再以 len(toolSets)>0 为门槛**（2026-09-26 改）：
+	// skill 也会注册工具（skill_load 等），skill-only 部署（无 MCP）
+	// 此前会完全静默——用户看不到白名单为空，直到某次调用被拒才困惑。
+	registered := executor.RegisteredTools()
+	if len(registered) > 0 {
+		logf("模型可见的工具名：%v", registered)
+	}
+	if allowed := executor.AllowedTools(); len(allowed) > 0 {
+		logf("工具策略：默认拒绝，放行 %v", allowed)
+	} else if len(registered) > 0 {
+		logf("工具策略：默认拒绝，白名单为空——%d 个已注册工具均不可执行",
+			len(registered))
+	}
+	// skill 专项提示：skill 工具同样受白名单管辖，但用户容易以为
+	// 「配了 TAIJI_SKILLS_ROOT 就能用」。此处显式点出未放行的 skill 工具。
+	if root := envSkillRoot(); root != "" {
+		var notAllowed []string
+		allowedSet := make(map[string]bool)
+		for _, a := range executor.AllowedTools() {
+			allowedSet[a] = true
 		}
-		if allowed := executor.AllowedTools(); len(allowed) > 0 {
-			logf("工具策略：默认拒绝，放行 %v", allowed)
+		for _, n := range registered {
+			if strings.HasPrefix(n, "skill_") && !allowedSet[n] {
+				notAllowed = append(notAllowed, n)
+			}
+		}
+		if len(notAllowed) > 0 {
+			logf("提示：skill 已启用（root=%s），但以下 skill 工具未在 "+
+				"TAIJI_ALLOW_TOOLS 中放行，模型无法调用：%v。"+
+				"若要使用，请把它们加入 TAIJI_ALLOW_TOOLS。",
+				root, notAllowed)
 		} else {
-			logf("工具策略：默认拒绝，白名单为空——%d 个已注册工具均不可执行",
-				len(registered))
+			logf("skill 已启用（root=%s），读类工具已放行。", root)
 		}
 	}
 
@@ -825,6 +854,36 @@ func envMaxToolIterations() int {
 		return defaultMaxToolIterations
 	}
 	return n
+}
+
+// envInstruction 读 serve 路径的系统提示。未配返回空。
+//
+// 为什么需要（2026-09-26 发现的缺口）：CLI 有 -instruction flag
+// （main.go:104），但 serve 装配此前**没有该字段**——飞书场景下模型
+// 拿到的是框架默认 instruction，用户无法施加任何引导。
+//
+// 为什么不用 CLI 的 flag：serve 是常驻进程，没有命令行交互，
+// 环境变量是与既有配置面（TAIJI_RBAC 等）一致的选择。
+func envInstruction() string {
+	return strings.TrimSpace(os.Getenv("TAIJI_INSTRUCTION"))
+}
+
+// envSkillRoot 读 skill 仓库根目录。未配返回空（不启用 skill）。
+//
+// 格式：目录路径，可含多个（os.PathListSeparator 分隔）。
+// 每个子目录含一个 SKILL.md（上游 skill.FSRepository 约定）。
+func envSkillRoot() string {
+	return strings.TrimSpace(os.Getenv("TAIJI_SKILLS_ROOT"))
+}
+
+// envSkillToolProfile 读 skill 工具档位。未配返回空（用上游默认）。
+//
+// 上游取值："full" | "knowledge-only"。空串时 newAgent 不传该 Option，
+// 上游按默认（KnowledgeOnly）处理——只注册读类 skill 工具，不含执行类。
+// 这是有意选择：serve 面向 IM 用户，执行类工具（skill_run 等）
+// 与「IM 来源只读」的语义冲突。
+func envSkillToolProfile() string {
+	return strings.TrimSpace(os.Getenv("TAIJI_SKILL_TOOL_PROFILE"))
 }
 
 // envRBAC 从环境读 RBAC 配置（Wave 2——决策三）。

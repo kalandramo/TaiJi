@@ -20,6 +20,12 @@ var ReservedKeys = map[string]struct{}{
 	"CREDENTIAL_REF": {},
 	"MCP_SERVERS":    {},
 	"TOOL_POLICY":    {},
+	// 2026-09-26 新增：serve 的系统提示与 skill 仓库根。
+	// 两者都影响 agent 行为——工作区若能覆盖，等于让 agent 改写
+	// 自己的指令（提权路径，与 MODEL_ROUTE 同一威胁模型）。
+	"TAIJI_INSTRUCTION":        {},
+	"TAIJI_SKILLS_ROOT":        {},
+	"TAIJI_SKILL_TOOL_PROFILE": {},
 }
 
 // CredentialKeys 是渠道凭据的保留键集合。
