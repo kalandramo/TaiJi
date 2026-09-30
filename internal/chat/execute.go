@@ -56,15 +56,41 @@ var ErrMissingSessionID = errors.New("chat: sessionID is required")
 // 所以服务端必须在启动时装配一次 Executor，而不是每条消息调一次 Execute。
 type Executor struct {
 	asm *assembly
+	// agentName 是本 executor 服务的 agent（来自 Options.AgentName）。
+	// 用于 session 键作用域化——不同 agent 的历史必须隔离。
+	agentName string
 }
 
 // NewExecutor 装配一个长驻执行器。服务端启动时调用一次。
+//
+// 多 agent 部署下**每个 agent 一个 Executor**（各自持独立 assembly，
+// 因而有独立的 session service 与工具面）。分流在选择 executor 时完成
+// （见 server 层的 agent 注册表），本类型不承担「选择」职责——
+// 那会让「装配」与「选择」两个关注点混在一起。
 func NewExecutor(opts Options) (*Executor, error) {
 	asm, err := newRunner(opts)
 	if err != nil {
 		return nil, err
 	}
-	return &Executor{asm: asm}, nil
+	return &Executor{
+		asm:       asm,
+		agentName: strings.TrimSpace(opts.AgentName),
+	}, nil
+}
+
+// scopedSessionID 按 agent 名作用域化 session 键。
+//
+// agentName 为空时原样返回——这是**向后兼容的关键**：既有单 agent 部署
+// 升级后 session 键不变，历史不失效。
+//
+// 非空时加 `{agent}#` 前缀。前缀格式与 router.go 的 EffectiveJID 无冲突
+// （后者形如 `feishu:ws1#chat`，本前缀在 `#` 之前再加一段 `agent#`，
+// 因 agent 名不允许 `#` 而保持可解析）。
+func scopedSessionID(agentName, sessionID string) string {
+	if agentName == "" {
+		return sessionID
+	}
+	return agentName + "#" + sessionID
 }
 
 // Close 释放 runner 资源。服务端退出时调用。
@@ -147,8 +173,11 @@ func (e *Executor) ExecuteStream(ctx context.Context, sessionID, input string, o
 		return "", ErrBlankInput
 	}
 
+	// session 键按 agent 作用域化（多 agent 历史隔离；单 agent 不变）。
+	scoped := scopedSessionID(e.agentName, sessionID)
+
 	var sb strings.Builder
-	if err := runOneTurn(ctx, e.asm.runner, e.asm.opts, sessionID, text, func(chunk string) {
+	if err := runOneTurn(ctx, e.asm.runner, e.asm.opts, scoped, text, func(chunk string) {
 		sb.WriteString(chunk)
 		if onChunk != nil {
 			onChunk(chunk)
@@ -288,7 +317,14 @@ func newRunner(opts Options) (*assembly, error) {
 		plugins = append(plugins, authz.NewPrincipalPolicyPlugin(opts.Permissions, opts.logf))
 	}
 
-	r := runner.NewRunner(opts.AppName, ag, runner.WithPlugins(plugins...))
+	runnerOpts := []runner.Option{runner.WithPlugins(plugins...)}
+	// 多 agent 部署可注入**共享** session service（见 Options.SessionService）。
+	// 共享时 session 键的 agent 前缀成为**必需**——否则同一用户在
+	// 不同 agent 的历史会互相串话（同 service 下键相同即同一会话）。
+	if opts.SessionService != nil {
+		runnerOpts = append(runnerOpts, runner.WithSessionService(opts.SessionService))
+	}
+	r := runner.NewRunner(opts.AppName, ag, runnerOpts...)
 	return &assembly{runner: r, agent: ag, policy: policy, opts: opts}, nil
 }
 

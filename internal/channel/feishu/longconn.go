@@ -203,6 +203,18 @@ func incomingFromLongConnEvent(ev *larkim.P2MessageReceiveV1) *channel.IncomingM
 		return nil
 	}
 
+	// 接收方应用 ID：多 bot 分流的依据（形态 C）。
+	//
+	// 两层判空是必需的：EventV2Base 是**嵌入指针**
+	// （依赖源码 service/im/v1/model.go:15220 `*larkevent.EventV2Base`），
+	// 两个层级都可能为 nil。此处不 fail-closed——AppID 缺失只影响
+	// 多 agent 分流，单 agent 部署下无意义；且入站路径吞消息的代价
+	// 高于放行（门禁与权限仍会判定主体）。
+	var appID string
+	if ev.EventV2Base != nil && ev.EventV2Base.Header != nil {
+		appID = ev.EventV2Base.Header.AppID
+	}
+
 	var chatID, chatType, messageID, content, threadID, rootID, messageType string
 	if m.ChatId != nil {
 		chatID = *m.ChatId
@@ -233,6 +245,7 @@ func incomingFromLongConnEvent(ev *larkim.P2MessageReceiveV1) *channel.IncomingM
 
 	return &channel.IncomingMessage{
 		Platform:  channel.PlatformFeishu,
+		AppID:     appID,
 		UserID:    openID,
 		ChatID:    chatID,
 		ChatType:  normalizeChatType(chatType),

@@ -26,6 +26,10 @@ var ReservedKeys = map[string]struct{}{
 	"TAIJI_INSTRUCTION":        {},
 	"TAIJI_SKILLS_ROOT":        {},
 	"TAIJI_SKILL_TOOL_PROFILE": {},
+	// 2026-09-30 新增：多 agent 配置（含每个 agent 的飞书 ak/sk）。
+	// 与 FEISHU_APP_ID 同一威胁模型——工作区可写 ⇒ 凭据劫持
+	// （攻击者可把某 agent 的 app_secret 换成自己已知的值）。
+	"TAIJI_AGENTS": {},
 }
 
 // CredentialKeys 是渠道凭据的保留键集合。

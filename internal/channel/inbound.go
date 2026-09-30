@@ -59,6 +59,17 @@ type IncomingMessage struct {
 	Mentions  []Mention
 	Meta      *ChannelMessageMeta
 
+	// AppID 是**接收此消息的飞书应用 ID**（来自事件头 Header.AppID）。
+	//
+	// 用途：多 bot 分流——不同 agent 绑定不同飞书应用，需据此判定
+	// 消息归属（形态 C：Bot 即 agent）。替代方案是人工维护
+	// 「会话 → agent」映射表，但事件头天然携带该信息，无需配置。
+	//
+	// 单应用部署时该字段为单一值，不参与判定（向后兼容）。
+	// 来源为 nil（事件头缺失）时为空串——调用方按「未配置多 agent」
+	// 处理，不得据此丢弃消息（否则 SDK 行为变化会导致全部消息被吞）。
+	AppID string
+
 	// UnsupportedKind 非空表示「消息类型本身不被支持」，值是平台原生的
 	// 消息类型（飞书为 image / file / audio / media / post / sticker 等）。
 	//

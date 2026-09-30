@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/kalandramo/TaiJi/internal/agentreg"
 	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/channel"
 	"github.com/kalandramo/TaiJi/internal/channel/cmd"
@@ -108,6 +109,28 @@ type Config struct {
 	// nil 表示**任何 OwnerOnly 命令都被拒**（fail-closed）。
 	OwnerCheck func(openID string) bool
 
+	// Agents 是「飞书应用 ID → agent 名」的分流注册表（多 agent 部署）。
+	//
+	// nil 表示未启用多 agent 分流——所有消息走 Config.Executor / Sender
+	// 的单值路径，行为与改动前完全一致（向后兼容的关键）。
+	//
+	// 非 nil 时必须同时提供 Executors / Senders，否则多 agent 下
+	// 找不到对应的执行器与出站端。
+	Agents *agentreg.Registry
+
+	// Executors 按 agent 名索引的执行器（多 agent 部署）。
+	//
+	// 与 Executor 的关系：Executor 是单 agent 路径（既有部署），
+	// Executors 是多 agent 路径。两者并存而非替换——单 agent 部署
+	// 无需构造 map，既有测试夹具零改动。
+	Executors map[string]Executor
+
+	// Senders 按 agent 名索引的出站端（多 agent 部署，凭据隔离）。
+	//
+	// **这是「每个 agent 绑定独立飞书应用」的落点**：不同 agent 的
+	// 回复必须用各自的 ak/sk 发出，否则用户会收到「来自错误 bot」的消息。
+	Senders map[string]channel.Sender
+
 	// SessionGen 返回会话的当前代数（/clear 用，SPEC §11.1.2）。
 	//
 	// nil 表示 /clear 不可用（Handler 会返回错误）。
@@ -176,6 +199,61 @@ type Pipeline struct {
 	// cancels 是 /stop 的基础设施（SPEC §5.4）。
 	// 恒非 nil——即使命令功能未启用，注册表本身零成本。
 	cancels *CancelRegistry
+
+	// ── 多 agent 分流（形态 C：Bot 即 agent）──
+	// agents 为 nil 表示未启用分流，走 sender/executor 单值路径。
+	agents    *agentreg.Registry
+	executors map[string]Executor
+	senders   map[string]channel.Sender
+}
+
+// resolveAgent 按入站消息的飞书应用 ID 解析目标 agent。
+//
+// 返回空 agent 名表示「未启用多 agent 分流」——调用方走单值路径。
+// 未知 AppID 返回错误（**fail-closed**）：静默落到默认 agent 会让
+// 配错的 bot 把消息喂给错误 agent，且表现为「功能正常但回答不对」，
+// 属最难排查的一类静默失效。
+func (p *Pipeline) resolveAgent(msg *channel.IncomingMessage) (string, error) {
+	if p.agents == nil {
+		return "", nil
+	}
+	agent, err := p.agents.Resolve(msg.AppID)
+	if err != nil {
+		return "", err
+	}
+	if agent == "" {
+		// 注册表非 nil 但返回空 agent——装配缺陷（注册表条目缺 name）。
+		return "", fmt.Errorf("server: app_id=%q 解析出空 agent 名", msg.AppID)
+	}
+	return agent, nil
+}
+
+// executorFor 返回指定 agent 的执行器。
+//
+// agent 为空串（未启用多 agent）时返回单值 executor，行为与改动前一致。
+func (p *Pipeline) executorFor(agent string) (Executor, error) {
+	if agent == "" {
+		return p.executor, nil
+	}
+	ex, ok := p.executors[agent]
+	if !ok {
+		return nil, fmt.Errorf("server: agent %q 无对应执行器（装配缺失）", agent)
+	}
+	return ex, nil
+}
+
+// senderFor 返回指定 agent 的出站端（**凭据隔离的落点**）。
+//
+// agent 为空串时返回单值 sender，行为与改动前一致。
+func (p *Pipeline) senderFor(agent string) (channel.Sender, error) {
+	if agent == "" {
+		return p.sender, nil
+	}
+	sd, ok := p.senders[agent]
+	if !ok {
+		return nil, fmt.Errorf("server: agent %q 无对应出站端（装配缺失）", agent)
+	}
+	return sd, nil
 }
 
 // New 装配管道。
@@ -216,6 +294,10 @@ func New(cfg Config) (*Pipeline, error) {
 		ownerCheck:  cfg.OwnerCheck,
 		sessionGen:  cfg.SessionGen,
 		cancels:     cancels,
+		// 多 agent 分流（形态 C）。nil 时全部走上面的单值字段。
+		agents:    cfg.Agents,
+		executors: cfg.Executors,
+		senders:   cfg.Senders,
 	}, nil
 }
 
@@ -255,6 +337,27 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 	// 会话标识含渠道前缀与 workspace，防跨渠道撞车（issue #7）。
 	target := channel.ResolveRoute(p.route, msg)
 	p.logf("server: routed message_id=%s jid=%s", msg.MessageID, target.EffectiveJID)
+
+	// ── 2.4 多 agent 分流（形态 C：Bot 即 agent）──
+	//
+	// **位置**：路由之后（需要 jid 做日志）、串行化之前。
+	// 放在串行化之前是因为分流只读消息头（零 IO），且失败要尽早。
+	//
+	// 未启用多 agent（p.agents == nil）时 agent 为空串，
+	// 后续走单值 executor/sender——行为与改动前完全一致。
+	//
+	// 未知 app_id **fail-closed**（不落到默认 agent）：静默错配会让
+	// 消息被喂给错误 agent，且表现为「功能正常但回答不对」。
+	agent, err := p.resolveAgent(msg)
+	if err != nil {
+		p.logf("server: 分流失败 message_id=%s app_id=%s err=%v",
+			msg.MessageID, msg.AppID, err)
+		return nil
+	}
+	if agent != "" {
+		p.logf("server: 分流 message_id=%s app_id=%s agent=%s",
+			msg.MessageID, msg.AppID, agent)
+	}
 
 	// ── 2.5 命令判定（新增，SPEC §5.1）──
 	//
@@ -359,7 +462,7 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 	// 但历史仍参与后续对话（假功能）。
 	sessionID := p.scopedSessionID(target.EffectiveJID)
 
-	return p.deliverAnswer(runCtx, sessionID, msg, receiver, idType)
+	return p.deliverAnswer(runCtx, sessionID, msg, receiver, idType, agent)
 }
 
 // scopedSessionID 把会话代数叠到 sessionID 上（SPEC §11.1.2）。
@@ -539,10 +642,22 @@ func (p *Pipeline) deliverAnswer(
 	msg *channel.IncomingMessage,
 	receiver string,
 	idType channel.ReceiveIDType,
+	agent string,
 ) error {
+	// 按 agent 选出站端与执行器（**凭据隔离的落点**）。
+	// agent 为空串时回退单值，行为与改动前一致。
+	sender, err := p.senderFor(agent)
+	if err != nil {
+		return err
+	}
+	executor, err := p.executorFor(agent)
+	if err != nil {
+		return err
+	}
+
 	// 尝试卡片流式路径。
-	if ss, ok := p.sender.(channel.StreamingSender); ok {
-		err := p.streamViaCard(runCtx, ss, sessionID, msg, receiver, idType)
+	if ss, ok := sender.(channel.StreamingSender); ok {
+		err := p.streamViaCard(runCtx, ss, sessionID, msg, receiver, idType, executor)
 		if err == nil {
 			return nil // 卡片路径成功
 		}
@@ -563,7 +678,7 @@ func (p *Pipeline) deliverAnswer(
 		p.logf("server: card streaming failed, falling back to text message_id=%s err=%v",
 			msg.MessageID, err)
 	}
-	return p.deliverAsText(runCtx, sessionID, msg, receiver, idType)
+	return p.deliverAsText(runCtx, sessionID, msg, receiver, idType, sender, executor)
 }
 
 // errCardStarted 标记「卡片消息已发出后」发生的失败。
@@ -585,6 +700,7 @@ func (p *Pipeline) streamViaCard(
 	msg *channel.IncomingMessage,
 	receiver string,
 	idType channel.ReceiveIDType,
+	executor Executor,
 ) error {
 	// 占位文本在**创建卡片时**写入——否则从卡片发出到首个 chunk
 	// 之间用户看到空白框（实测缺陷）。
@@ -601,7 +717,7 @@ func (p *Pipeline) streamViaCard(
 	// 节流器：避免每个 token 都触发网络请求（见 throttle.go）。
 	th := newChunkThrottle()
 
-	answer, execErr := p.executor.ExecuteStream(runCtx, sessionID, msg.Content,
+	answer, execErr := executor.ExecuteStream(runCtx, sessionID, msg.Content,
 		func(chunk string) {
 			full := th.Add(chunk)
 			if !th.ShouldFlush(time.Now()) {
@@ -646,16 +762,18 @@ func (p *Pipeline) deliverAsText(
 	msg *channel.IncomingMessage,
 	receiver string,
 	idType channel.ReceiveIDType,
+	sender channel.Sender,
+	executor Executor,
 ) error {
 	// 先发占位消息，拿到 message_id 供后续更新（§4.4.1 的简化版流式）。
-	placeholderID, err := p.sender.SendMessage(runCtx, receiver, p.placeholder, channel.SendOptions{
+	placeholderID, err := sender.SendMessage(runCtx, receiver, p.placeholder, channel.SendOptions{
 		ReceiveIDType: idType,
 	})
 	if err != nil {
 		return fmt.Errorf("server: send placeholder: %w", err)
 	}
 
-	answer, execErr := p.executor.Execute(runCtx, sessionID, msg.Content)
+	answer, execErr := executor.Execute(runCtx, sessionID, msg.Content)
 
 	// ── 5. 出站 ──
 	// 无论执行成功与否都要更新占位消息——否则用户会看到一条永远「思考中…」
@@ -665,7 +783,7 @@ func (p *Pipeline) deliverAsText(
 		final = "抱歉，处理时出错：" + execErr.Error()
 		p.logf("server: execute failed message_id=%s err=%v", msg.MessageID, execErr)
 	}
-	if _, err := p.sender.SendMessage(runCtx, receiver, final, channel.SendOptions{
+	if _, err := sender.SendMessage(runCtx, receiver, final, channel.SendOptions{
 		ReceiveIDType: idType,
 		MessageID:     placeholderID,
 	}); err != nil {

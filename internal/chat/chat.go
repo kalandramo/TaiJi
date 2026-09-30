@@ -16,6 +16,7 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 
 	"github.com/kalandramo/TaiJi/internal/authz"
@@ -95,6 +96,26 @@ type Options struct {
 	// 「不依赖具体能力实现」的定位（与 cmd 包不 import authz 同构）。
 	// 仓库构造与失败处理在装配期本包内完成。
 	SkillRoot string
+
+	// AgentName 是本次装配服务的 agent 标识（多 agent 部署用）。
+	//
+	// 作用：决定 session 键是否加 agent 前缀——不同 agent 的历史必须隔离
+	// （同一用户在 agent A 的对话不应出现在 agent B 的上下文里）。
+	//
+	// 空串表示单 agent 部署，session 键**保持原样**（向后兼容：既有部署
+	// 升级后历史不失效）。这比「恒加前缀」更保守——后者会让所有现有
+	// 会话历史在升级瞬间失联。
+	AgentName string
+
+	// SessionService 是**可选的共享** session 存储（多 agent 部署用）。
+	//
+	// nil 时每个 Executor 各建一份 inmemory（默认，等价单 agent 行为）。
+	// 非 nil 时多个 agent 共享同一存储——省内存，但**必须**配合
+	// AgentName（session 键加 agent 前缀），否则同名会话会串话。
+	//
+	// 为什么提供共享选项：多 agent 部署若各持一份 session 存储，
+	// 内存随 agent 数线性增长，而多数部署的历史互访需求有限。
+	SessionService session.Service
 
 	// SkillToolProfile 控制启用哪些上游 skill 工具。
 	//

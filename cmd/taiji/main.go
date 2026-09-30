@@ -21,6 +21,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/kalandramo/TaiJi/internal/agentreg"
 	"github.com/kalandramo/TaiJi/internal/authz"
 	"github.com/kalandramo/TaiJi/internal/bootstrap"
 	"github.com/kalandramo/TaiJi/internal/channel"
@@ -29,6 +30,9 @@ import (
 	"github.com/kalandramo/TaiJi/internal/chat"
 	"github.com/kalandramo/TaiJi/internal/config"
 	"github.com/kalandramo/TaiJi/internal/server"
+
+	"trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
 // signalContext 返回在收到中断信号时取消的 context，
@@ -399,6 +403,20 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 		fmt.Fprintf(logw, "[pipeline] "+format+"\n", args...)
 	}
 
+	// agent 配置（多 agent + 每 agent 独立飞书应用）。
+	// 未配 TAIJI_AGENTS 时回退单 agent（读 FEISHU_APP_ID/SECRET）。
+	agentSpecs, err := parseAgents()
+	if err != nil {
+		return nil, err
+	}
+	if len(agentSpecs) > 1 {
+		var names []string
+		for _, a := range agentSpecs {
+			names = append(names, a.Name)
+		}
+		logf("多 agent 模式：%v（每个 agent 独立飞书应用与 session）", names)
+	}
+
 	// 模型装配：与 chat 子命令同源。
 	modelCfg := bootstrap.ModelConfigFromEnv()
 	if v, ok := loaded[bootstrap.EnvModelName]; ok && v != "" {
@@ -590,10 +608,29 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 		CancelRun:    cancels.Cancel,
 	})
 
+	// ── 多 agent 装配（形态 C：Bot 即 agent）──
+	//
+	// 每个 agent 一套 executor + sender：前者保证 session 与工具面隔离，
+	// 后者保证**凭据隔离**（回复必须来自该 agent 绑定的飞书应用）。
+	//
+	// 单 agent 部署（TAIJI_AGENTS 未配）时 agents==nil，
+	// 上面的 executor/sender 单值即可，行为与改动前完全一致。
+	agentsReg, executors, senders, err := buildAgents(
+		agentSpecs, modelCfg, allowTools, permissions, toolSets, logw)
+	if err != nil {
+		executor.Close()
+		bootstrap.CloseMCPSets(toolSets)
+		return nil, err
+	}
+
 	p, err := server.New(server.Config{
 		Sender:   sender,
 		Executor: executor,
 		Gate:     gateCfg,
+		// 多 agent（nil 表示未启用，走上面的单值路径）。
+		Agents:    agentsReg,
+		Executors: executors,
+		Senders:   senders,
 		Route: channel.RouteConfig{
 			WorkspaceID: wsID,
 			// 群聊按话题分流（§4.4.4 的 thread_map）；单聊无话题概念。
@@ -731,44 +768,79 @@ func envAllowTools() []string {
 //     larkws.Client.Start 末尾是裸 select{}（ws/client.go:206-232），
 //     不观察 ctx，socket 会存活并自动重连（AC-6 要防的正是这个）。
 func runLongConn(loaded map[string]string, pipeline *pipelineHolder, dispatcher *server.Dispatcher) int {
-	senderCfg := feishu.SenderConfigFromEnv(loaded)
-	if senderCfg.AppID == "" || senderCfg.AppSecret == "" {
-		fmt.Fprintf(os.Stderr,
-			"taiji serve: 长连接模式需要 %s 与 %s（凭据只从启动环境读，见设计文档 §4.6）。\n",
-			feishu.EnvAppID, feishu.EnvAppSecret)
-		return 1
-	}
-
-	lc, err := feishu.NewLongConn(feishu.LongConnConfig{
-		AppID:     senderCfg.AppID,
-		AppSecret: senderCfg.AppSecret,
-		// 入站复用同一套去重 + 异步分发——两条入站路径的
-		// 下游行为必须一致，否则语义会因入口不同而分叉。
-		OnMessage: dispatcher.Enqueue,
-		Logf:      func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
-	})
+	// 多 agent 部署：每个 agent 一条长连接（各自的应用凭据）。
+	// 单 agent 时退化为一条，与改动前一致。
+	specs, err := parseAgents()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "taiji serve: %v\n", err)
 		return 1
 	}
 
+	logfErr := func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+
+	// 逐 agent 建长连接。任一失败即整体失败——缺一条连接意味着
+	// 某个 bot 的消息永远收不到，静默降级会造成「部分功能可用」的假象。
+	var conns []*feishu.LongConn
+	for _, spec := range specs {
+		if spec.AppID == "" || spec.AppSecret == "" {
+			fmt.Fprintf(os.Stderr,
+				"taiji serve: agent %q 缺少飞书凭据（%s / %s）。\n"+
+					"凭据只从启动环境读（见设计文档 §4.6）。\n",
+				spec.Name, feishu.EnvAppID, feishu.EnvAppSecret)
+			for _, c := range conns {
+				c.Stop()
+			}
+			return 1
+		}
+		lc, cerr := feishu.NewLongConn(feishu.LongConnConfig{
+			AppID:     spec.AppID,
+			AppSecret: spec.AppSecret,
+			// 入站复用同一套去重 + 异步分发——两条入站路径的
+			// 下游行为必须一致，否则语义会因入口不同而分叉。
+			OnMessage: dispatcher.Enqueue,
+			Logf:      logfErr,
+		})
+		if cerr != nil {
+			fmt.Fprintf(os.Stderr, "taiji serve: agent %q 建长连接: %v\n", spec.Name, cerr)
+			for _, c := range conns {
+				c.Stop()
+			}
+			return 1
+		}
+		conns = append(conns, lc)
+	}
+	if len(conns) > 1 {
+		fmt.Fprintln(os.Stderr, "taiji serve: 多 agent 长连接已装配", len(conns), "条")
+	}
+
 	ctx, cancel := signalContext()
 	defer cancel()
 
-	if err := lc.Start(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "taiji serve: 启动长连接失败: %v\n", err)
-		return 1
+	// 逐条启动。任一失败则回滚已启动的——避免留下半启动状态
+	// （部分 bot 收消息、部分收不到，排查成本高）。
+	for i, c := range conns {
+		if err := c.Start(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "taiji serve: 启动长连接 #%d 失败: %v\n", i+1, err)
+			for _, started := range conns[:i] {
+				started.Stop()
+			}
+			return 1
+		}
 	}
-	fmt.Fprintln(os.Stderr, "taiji serve: 长连接已启动（无需公网入口）")
+	fmt.Fprintf(os.Stderr, "taiji serve: 长连接已启动（%d 条，无需公网入口）\n", len(conns))
 
 	<-ctx.Done()
 	fmt.Fprintln(os.Stderr, "\ntaiji serve: 收到中断信号，正在关闭…")
 
 	// 顺序：先停长连接（不再收新消息）→ 再停分发器（等在途处理完）。
 	// Stop 内部调 SDK 的 Close()，真正断开 socket（AC-6）。
-	lc.Stop()
-	if err := lc.StartErr(); err != nil {
-		fmt.Fprintf(os.Stderr, "taiji serve: 长连接异常退出: %v\n", err)
+	// 多条连接逐个停——SDK 的 Start 阻塞于裸 select{} 不观察 ctx，
+	// 只取消 ctx 不会断连（见 runLongConn 的注释）。
+	for i, c := range conns {
+		c.Stop()
+		if err := c.StartErr(); err != nil {
+			fmt.Fprintf(os.Stderr, "taiji serve: 长连接 #%d 异常退出: %v\n", i+1, err)
+		}
 	}
 	dispatcher.Stop()
 	fmt.Fprintln(os.Stderr, "taiji serve: 已关闭")
@@ -854,6 +926,78 @@ func envMaxToolIterations() int {
 		return defaultMaxToolIterations
 	}
 	return n
+}
+
+// buildAgents 为多 agent 部署构造注册表 + 每 agent 的 executor 与 sender。
+//
+// 返回 (nil, nil, nil, nil) 表示**未启用多 agent**——调用方走单值路径，
+// 行为与改动前完全一致（向后兼容的关键）。
+//
+// 只在 spec 数 > 1 时才构造多 agent：单 agent 时复用 buildPipeline 里
+// 已建好的 executor/sender，避免重复装配。
+func buildAgents(
+	specs []agentSpec,
+	modelCfg bootstrap.ModelConfig,
+	allowTools []string,
+	permissions authz.PermissionSource,
+	toolSets []tool.ToolSet,
+	logw io.Writer,
+) (*agentreg.Registry, map[string]server.Executor, map[string]channel.Sender, error) {
+	if len(specs) <= 1 {
+		return nil, nil, nil, nil
+	}
+
+	// 共享 session 存储：agent 间历史隔离靠 session 键的 agent 前缀
+	// （见 chat.scopedSessionID），而非各自的存储——后者会让内存
+	// 随 agent 数线性增长。
+	sharedSessions := inmemory.NewSessionService()
+
+	entries := make([]agentreg.Entry, 0, len(specs))
+	executors := make(map[string]server.Executor, len(specs))
+	senders := make(map[string]channel.Sender, len(specs))
+
+	for _, spec := range specs {
+		// 每个 agent 一个 executor（session 前缀隔离 + 独立工具面）。
+		ex, err := chat.NewExecutor(chat.Options{
+			Config:            modelCfg,
+			AppName:           "taiji",
+			UserID:            "feishu",
+			AgentName:         spec.Name,
+			SessionService:    sharedSessions,
+			ToolSets:          toolSets,
+			AllowTools:        allowTools,
+			Permissions:       permissions,
+			MaxToolIterations: envMaxToolIterations(),
+			Instruction:       envInstruction(),
+			SkillRoot:         envSkillRoot(),
+			SkillToolProfile:  envSkillToolProfile(),
+			Echo:              logw,
+		})
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("装配 agent %q 的执行器: %w", spec.Name, err)
+		}
+
+		// 每个 agent 一个 sender（**凭据隔离的落点**）。
+		// Sender 无 Close——SDK client 持有连接池但无需显式释放。
+		sd, err := feishu.NewSender(feishu.SenderConfig{
+			AppID:     spec.AppID,
+			AppSecret: spec.AppSecret,
+		})
+		if err != nil {
+			ex.Close()
+			return nil, nil, nil, fmt.Errorf("装配 agent %q 的出站端: %w", spec.Name, err)
+		}
+
+		executors[spec.Name] = ex
+		senders[spec.Name] = sd
+		entries = append(entries, agentreg.Entry{AppID: spec.AppID, Agent: spec.Name})
+	}
+
+	reg, err := agentreg.New(entries)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return reg, executors, senders, nil
 }
 
 // envInstruction 读 serve 路径的系统提示。未配返回空。
