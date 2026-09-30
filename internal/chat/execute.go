@@ -100,6 +100,21 @@ func (e *Executor) Close() {
 	}
 }
 
+// AgentName 返回**框架层**的 agent 名（读自实际 agent，非配置回显）。
+//
+// 为什么读 e.asm.agent.Info().Name 而非存储字段：测试要能证明
+// `llmagent.New` 真的拿到了这个名字——若只是回显 Options，那么
+// 新名不生效的缺陷会被测试放过（空转）。
+//
+// 与 e.agentName 的区别：后者是 session 键前缀的来源（空串表示不加
+// 前缀，见 scopedSessionID）；本方法返回的恒非空（未配置时是 "assistant"）。
+func (e *Executor) AgentName() string {
+	if e == nil || e.asm == nil || e.asm.agent == nil {
+		return ""
+	}
+	return e.asm.agent.Info().Name
+}
+
 // RegisteredTools 返回模型可见的工具名（排序后）。
 //
 // 用途：调用方在启动期打印「实际有哪些工具可放行」，避免配错名字后
@@ -264,6 +279,14 @@ func newAgent(opts Options, m model.Model) (*llmagent.LLMAgent, error) {
 			llmagent.WithToolIterationLimitFinalization(opts.ToolIterationFinalization),
 		)
 	}
+	// agent 名必须**真正生效**（不只是 session 前缀）：
+	// 上游的父子定位 `FindSubAgent(name)`（trpc-agent-go 的
+	// agent/agent.go:69-72）与 transfer_to_agent 的 agent_name 参数
+	// 都依赖它唯一。
+	if name := strings.TrimSpace(opts.AgentName); name != "" {
+		return llmagent.New(name, agentOpts...), nil
+	}
+	// 向后兼容：未指定时仍叫 assistant（既有部署的遥测标签不变）。
 	return llmagent.New("assistant", agentOpts...), nil
 }
 

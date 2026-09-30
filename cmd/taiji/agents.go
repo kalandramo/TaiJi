@@ -19,7 +19,7 @@ const envAgentsKey = "TAIJI_AGENTS"
 // 保证既有部署升级后 agent 名不变。
 const defaultAgentName = "assistant"
 
-// agentSpec 是一个 agent 的配置（名 + 其绑定的飞书应用凭据）。
+// agentSpec 是一个 agent 的配置（名 + 凭据 + 隔离参数）。
 type agentSpec struct {
 	// Name 是 agent 标识，用于日志与执行层选择。
 	Name string
@@ -29,6 +29,23 @@ type agentSpec struct {
 	// 出站按同一 agent 选凭据（形成闭环）。
 	AppID     string
 	AppSecret string
+
+	// ── 隔离参数（全部可选，留空则用全局默认）──
+
+	// Parent 是父 agent 名（N1 父子关系）。空表示顶层 agent。
+	Parent string
+	// Instruction 是该 agent 的系统提示（N2）。空则用 TAIJI_INSTRUCTION。
+	Instruction string
+	// Skills 是该 agent 的 skill 仓库根（N3）。空则用 TAIJI_SKILLS_ROOT。
+	Skills string
+	// AllowTools 是该 agent 的 MCP 工具白名单（N4）。
+	// 空则用 TAIJI_ALLOW_TOOLS。
+	//
+	// 值用 `|` 分隔而非逗号——逗号已是字段分隔符，再用会歧义。
+	AllowTools []string
+	// Roles 是该 agent 的权限角色（N5，留待 RBAC 的 agent 维度使用）。
+	// 值用 `|` 分隔。
+	Roles []string
 }
 
 // parseAgents 解析 TAIJI_AGENTS（多 agent 配置）。
@@ -87,7 +104,72 @@ func parseAgents() ([]agentSpec, error) {
 	if len(specs) == 0 {
 		return nil, fmt.Errorf("%s 配置错误：未解析出任何 agent", envAgentsKey)
 	}
+
+	// 父子关系的完整性校验（N1）。
+	//
+	// 两项必查，缺一不可：
+	//  1. 父必须存在——否则该子永远无法被 transfer 到（静默失效）。
+	//  2. 不得成环——拓扑序装配会无限递归；且 FindSubAgent 语义未定义。
+	if err := validateParents(specs); err != nil {
+		return nil, err
+	}
+
 	return specs, nil
+}
+
+// validateParents 校验父子声明的引用完整性与无环性。
+func validateParents(specs []agentSpec) error {
+	byName := make(map[string]agentSpec, len(specs))
+	for _, s := range specs {
+		byName[s.Name] = s
+	}
+
+	// 1) 父必须存在。
+	for _, s := range specs {
+		if s.Parent == "" {
+			continue
+		}
+		if _, ok := byName[s.Parent]; !ok {
+			return fmt.Errorf(
+				"%s 配置错误：agent %q 的 parent %q 未定义——"+
+					"该子 agent 将永远无法被调用",
+				envAgentsKey, s.Name, s.Parent)
+		}
+	}
+
+	// 2) 无环（含自环）。用着色法：未访问/在栈上/已完成。
+	const (
+		unvisited = 0
+		inStack   = 1
+		done      = 2
+	)
+	state := make(map[string]int, len(specs))
+	var walk func(name string, path []string) error
+	walk = func(name string, path []string) error {
+		switch state[name] {
+		case inStack:
+			return fmt.Errorf(
+				"%s 配置错误：父子关系成环（环路径：%v → %s）——"+
+					"拓扑序装配会无限递归",
+				envAgentsKey, path, name)
+		case done:
+			return nil
+		}
+		state[name] = inStack
+		if p := byName[name].Parent; p != "" {
+			if err := walk(p, append(path, name)); err != nil {
+				return err
+			}
+		}
+		state[name] = done
+		return nil
+	}
+	for _, s := range specs {
+		if err := walk(s.Name, nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // parseAgentEntry 解析单条 agent 定义（逗号分隔字段）。
@@ -113,6 +195,17 @@ func parseAgentEntry(entry string) (agentSpec, error) {
 			spec.AppID = v
 		case "app_secret":
 			spec.AppSecret = v
+		case "parent":
+			spec.Parent = v
+		case "instruction":
+			spec.Instruction = v
+		case "skills":
+			spec.Skills = v
+		case "allow_tools":
+			// `|` 分隔——逗号是字段分隔符，不能再用于列表。
+			spec.AllowTools = splitPipeList(v)
+		case "roles":
+			spec.Roles = splitPipeList(v)
 		}
 	}
 
@@ -130,6 +223,20 @@ func parseAgentEntry(entry string) (agentSpec, error) {
 			"%s 配置错误：agent %q 缺少 app_secret", envAgentsKey, spec.Name)
 	}
 	return spec, nil
+}
+
+// splitPipeList 按 `|` 切分并去空白，丢弃空项。
+//
+// 为什么不用逗号：逗号已是 agent 字段的分隔符（name=,app_id=,...），
+// 再用于列表会让 `allow_tools=a,b` 与 `name=x,allow_tools=a,b` 歧义。
+func splitPipeList(v string) []string {
+	var out []string
+	for _, s := range strings.Split(v, "|") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // singleAgentFromLegacyEnv 从旧环境变量构造单 agent（向后兼容路径）。
