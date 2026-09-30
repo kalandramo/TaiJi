@@ -176,7 +176,7 @@ func (p *RBACPermissions) Allowed(_ context.Context, req AccessRequest) (bool, e
 		return false, nil // 未绑定角色：拒绝
 	}
 	for _, pat := range perms {
-		if matchToolPattern(pat, req.Action) {
+		if matchPatternForAgent(pat, req.Action, req.Agent) {
 			return true, nil
 		}
 	}

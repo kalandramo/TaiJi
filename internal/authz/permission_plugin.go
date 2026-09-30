@@ -74,6 +74,10 @@ func (p *PrincipalPolicyPlugin) beforeTool() tool.BeforeToolCallbackStructured {
 			// Resource 来自 ctx（由管道注入工作区 ID）。
 			// v1 不参与判定，但透传——v2 资源级直接可用，无需再改消费方。
 			Resource: ResourceFrom(ctx),
+			// Agent 来自 ctx（由管道在多 agent 分流后注入）。
+			// v1 **参与判定**——权限点可用 `agent:{name}:{pattern}` 限定
+			// （见 matchPatternForAgent）。空串表示单 agent 部署。
+			Agent: AgentFrom(ctx),
 		})
 		if err != nil {
 			// 查不了 ≠ 不允许。两者都拒，但日志必须区分——

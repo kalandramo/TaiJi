@@ -41,6 +41,16 @@ type AccessRequest struct {
 	Action string
 	// Resource 是资源标识。v1 为工作区 ID（可能为空——非渠道来源）。
 	Resource string
+	// Agent 是执行该动作的 agent 名（多 agent 部署下的隔离维度）。
+	//
+	// 空串表示**单 agent 部署**（或不区分 agent）——此时行为与引入该
+	// 字段前**完全一致**（向后兼容）。
+	//
+	// 与 Resource 的关系：两者都是判定的上下文维度，但参与判定的时机
+	// 不同——Resource 在 v1 **不参与**（预留），Agent 在 v1 **参与**
+	// （权限点可用 `agent:{name}:{pattern}` 限定，见 matchToolPattern）。
+	// 差异的理由：agent 隔离是明确需求，而资源级判定尚无消费方。
+	Agent string
 }
 
 // PermissionSource 回答"某主体能否执行某动作"。
@@ -118,7 +128,7 @@ func (s *StaticPermissions) Allowed(_ context.Context, req AccessRequest) (bool,
 		return false, nil // 未列出的主体：拒绝
 	}
 	for _, pat := range patterns {
-		if matchToolPattern(pat, req.Action) {
+		if matchPatternForAgent(pat, req.Action, req.Agent) {
 			return true, nil
 		}
 	}
@@ -131,6 +141,9 @@ func (s *StaticPermissions) Allowed(_ context.Context, req AccessRequest) (bool,
 //   - "*"        匹配一切
 //   - "prefix_*" 前缀匹配
 //   - 其他       精确匹配（大小写敏感，与工具名校验一致）
+//
+// **agent 限定模式**（`agent:{name}:{toolPattern}`）由
+// matchPatternForAgent 处理——本函数只看裸模式，保持既有调用点语义不变。
 func matchToolPattern(pattern, toolName string) bool {
 	if pattern == "*" {
 		return true
@@ -139,6 +152,53 @@ func matchToolPattern(pattern, toolName string) bool {
 		return strings.HasPrefix(toolName, strings.TrimSuffix(pattern, "*"))
 	}
 	return pattern == toolName
+}
+
+// agentPatternPrefix 是 agent 限定权限点的前缀。
+const agentPatternPrefix = "agent:"
+
+// matchPatternForAgent 判断权限点是否对「该 agent 的该动作」生效。
+//
+// 两类权限点：
+//
+//	裸模式   `mockmcp_echo` / `srv_*` / `*`
+//	         ⇒ **全局**，对所有 agent 生效。
+//	         （必须是全局——否则任何部署一旦启用多 agent，
+//	          现有配置会静默失去全部权限，比缺功能严重得多。）
+//
+//	agent 限定 `agent:{name}:{toolPattern}`
+//	         ⇒ 仅当 requestAgent == name 时生效。
+//	           requestAgent 为空（单 agent 部署）时**不生效**——
+//	           没有 agent 可判，放行会让限定形同虚设（fail-closed）。
+//
+// 形态非法（如 `agent:ops` 缺第三段、`agent::x` 空名）一律不匹配
+// （fail-closed，与项目取向一致）。
+func matchPatternForAgent(pattern, toolName, requestAgent string) bool {
+	rest, ok := strings.CutPrefix(pattern, agentPatternPrefix)
+	if !ok {
+		// 裸模式：全局生效。
+		return matchToolPattern(pattern, toolName)
+	}
+
+	// agent 限定：拆 `{name}:{toolPattern}`。
+	name, toolPat, found := strings.Cut(rest, ":")
+	if !found {
+		return false // 缺第三段 → 形态非法
+	}
+	name = strings.TrimSpace(name)
+	toolPat = strings.TrimSpace(toolPat)
+	if name == "" || toolPat == "" {
+		return false // 空名或空模式 → 形态非法
+	}
+
+	// 单 agent 部署（requestAgent 为空）时限定不生效。
+	if requestAgent == "" {
+		return false
+	}
+	if name != requestAgent {
+		return false // 其他 agent 的专属权限
+	}
+	return matchToolPattern(toolPat, toolName)
 }
 
 // PrincipalCount 返回表中有权限条目的主体数（供启动期日志）。

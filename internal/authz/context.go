@@ -86,6 +86,39 @@ func RequireWritable(ctx context.Context) error {
 
 type resourceCtxKey struct{}
 
+// ── agent 上下文（N5 权限隔离）──
+//
+// 动机：多 agent 部署下，「同一用户在 agent A 有权限、在 agent B 无权限」
+// 需要判定时知道**正在哪个 agent 上执行**。
+//
+// 与 Resource 的分工：Resource 管「对什么」，Agent 管「在谁的上下文里」。
+// 两者正交，可同时存在。
+//
+// 为什么走 ctx 而非参数：权限判定发生在插件回调（beforeTool）内，
+// 那里拿不到调用方的参数，只能从 ctx 取——与 Principal/Resource 同路径。
+
+type agentCtxKey struct{}
+
+// WithAgent 把 agent 名注入上下文。空值等价于未注入。
+func WithAgent(ctx context.Context, agent string) context.Context {
+	if ctx == nil || agent == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, agentCtxKey{}, agent)
+}
+
+// AgentFrom 读取 agent 名。未注入时返回空串。
+//
+// 空串是合法状态（单 agent 部署）——此时 agent 限定权限点不生效
+// （见 matchPatternForAgent），裸模式照常生效。
+func AgentFrom(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(agentCtxKey{}).(string)
+	return v
+}
+
 // WithResource 把资源标识注入上下文。空值等价于未注入。
 func WithResource(ctx context.Context, resource string) context.Context {
 	if ctx == nil || resource == "" {

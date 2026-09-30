@@ -442,6 +442,12 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 	// v2 资源级判定无需再改消费方。
 	runCtx = authz.WithResource(runCtx, p.route.WorkspaceID)
 
+	// agent 注入（N5 权限隔离）：权限判定发生在插件回调内，那里拿不到
+	// 调用方参数，只能从 ctx 取——与本行的 Principal/Resource 同路径。
+	//
+	// 空 agent（未启用多 agent）时 WithAgent 是 no-op，行为不变。
+	runCtx = authz.WithAgent(runCtx, agent)
+
 	// ── 4. 执行 + 5. 出站 ──
 	//
 	// 两条路径（issue #10）：
