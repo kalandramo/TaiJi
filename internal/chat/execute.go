@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/plugin"
@@ -98,6 +99,21 @@ func (e *Executor) Close() {
 	if e != nil {
 		e.asm.Close()
 	}
+}
+
+// Agent 返回底层的 llmagent（供调用方查询父子结构与工具面）。
+//
+// 为什么暴露：装配期需按拓扑序建 agent（父依赖子已建好），且调用方
+// 可能要检查 FindSubAgent/SubAgents。返回接口类型而非具体类型，
+// 避免把上游结构体泄漏到调用方签名里。
+//
+// 只读用途——不要在运行期改它（上游的 SetSubAgents 等会与
+// 正在执行的 invocation 竞争）。
+func (e *Executor) Agent() agent.Agent {
+	if e == nil || e.asm == nil {
+		return nil
+	}
+	return e.asm.agent
 }
 
 // AgentName 返回**框架层**的 agent 名（读自实际 agent，非配置回显）。
@@ -267,6 +283,16 @@ func newAgent(opts Options, m model.Model) (*llmagent.LLMAgent, error) {
 		// {toolSetName}_{originalName}（见 trpc internal/tool/toolset.go:251），
 		// 从而避免多个 MCP server 的同名工具冲突（issue #3 AC-2）。
 		agentOpts = append(agentOpts, llmagent.WithToolSets(opts.ToolSets))
+	}
+	// 父子关系（N1）：挂子 agent。
+	//
+	// 上游会给本 agent 的 Tools() 追加**一个** transfer_to_agent 工具
+	// （不是每子一个），模型在其中通过 agent_name 选目标。
+	//
+	// 注意：子 agent 是**独立装配**的 LLMAgent，各自的 Tools() 只返回
+	// 自己的集合——工具隔离靠 SubAgents 天然成立。
+	if len(opts.SubAgents) > 0 {
+		agentOpts = append(agentOpts, llmagent.WithSubAgents(opts.SubAgents))
 	}
 	// 工具调用轮次上限：给「确定性拒绝」加协议层兜底（见 Options 注释）。
 	//

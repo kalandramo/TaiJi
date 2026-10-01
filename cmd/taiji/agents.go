@@ -43,9 +43,6 @@ type agentSpec struct {
 	//
 	// 值用 `|` 分隔而非逗号——逗号已是字段分隔符，再用会歧义。
 	AllowTools []string
-	// Roles 是该 agent 的权限角色（N5，留待 RBAC 的 agent 维度使用）。
-	// 值用 `|` 分隔。
-	Roles []string
 }
 
 // parseAgents 解析 TAIJI_AGENTS（多 agent 配置）。
@@ -204,8 +201,6 @@ func parseAgentEntry(entry string) (agentSpec, error) {
 		case "allow_tools":
 			// `|` 分隔——逗号是字段分隔符，不能再用于列表。
 			spec.AllowTools = splitPipeList(v)
-		case "roles":
-			spec.Roles = splitPipeList(v)
 		}
 	}
 

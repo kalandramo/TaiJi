@@ -31,6 +31,8 @@ import (
 	"github.com/kalandramo/TaiJi/internal/config"
 	"github.com/kalandramo/TaiJi/internal/server"
 
+	"trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -956,41 +958,45 @@ func buildAgents(
 	executors := make(map[string]server.Executor, len(specs))
 	senders := make(map[string]channel.Sender, len(specs))
 
-	for _, spec := range specs {
-		// 每个 agent 一个 executor（session 前缀隔离 + 独立工具面）。
-		ex, err := chat.NewExecutor(chat.Options{
-			Config:            modelCfg,
-			AppName:           "taiji",
-			UserID:            "feishu",
-			AgentName:         spec.Name,
-			SessionService:    sharedSessions,
-			ToolSets:          toolSets,
-			AllowTools:        allowTools,
-			Permissions:       permissions,
-			MaxToolIterations: envMaxToolIterations(),
-			Instruction:       envInstruction(),
-			SkillRoot:         envSkillRoot(),
-			SkillToolProfile:  envSkillToolProfile(),
-			Echo:              logw,
-		})
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("装配 agent %q 的执行器: %w", spec.Name, err)
-		}
+	// 已建好的 agent 按名索引——父装配时需要拿到子的实例。
+	builtAgents := make(map[string]agent.Agent, len(specs))
 
-		// 每个 agent 一个 sender（**凭据隔离的落点**）。
-		// Sender 无 Close——SDK client 持有连接池但无需显式释放。
-		sd, err := feishu.NewSender(feishu.SenderConfig{
-			AppID:     spec.AppID,
-			AppSecret: spec.AppSecret,
-		})
-		if err != nil {
-			ex.Close()
-			return nil, nil, nil, fmt.Errorf("装配 agent %q 的出站端: %w", spec.Name, err)
-		}
+	byName := make(map[string]agentSpec, len(specs))
+	for _, s := range specs {
+		byName[s.Name] = s
+	}
 
-		executors[spec.Name] = ex
-		senders[spec.Name] = sd
-		entries = append(entries, agentreg.Entry{AppID: spec.AppID, Agent: spec.Name})
+	// **拓扑序装配**：先建叶子（无未建之子），再逐层向上。
+	//
+	// 为什么不能单趟循环：父需要把**已构造好的子实例**传给
+	// WithSubAgents，而子可能声明在父之后（TAIJI_AGENTS 的条目顺序
+	// 不应成为约束）。
+	//
+	// parseAgents 的 validateParents 已保证无环，故必然终止；
+	// 下面的 !progressed 分支是防御（防有人绕过 parseAgents 传 specs）。
+	remaining := append([]agentSpec(nil), specs...)
+	for len(remaining) > 0 {
+		progressed := false
+		var next []agentSpec
+		for _, spec := range remaining {
+			children, ready := collectChildren(spec, byName, builtAgents)
+			if !ready {
+				next = append(next, spec)
+				continue
+			}
+			if err := buildOne(spec, children, modelCfg, allowTools, permissions,
+				toolSets, sharedSessions, logw, executors, senders, builtAgents,
+				&entries); err != nil {
+				return nil, nil, nil, err
+			}
+			progressed = true
+		}
+		if !progressed {
+			return nil, nil, nil, fmt.Errorf(
+				"装配 agent：拓扑序无法推进（剩余 %d 个）——父子关系可能有环",
+				len(remaining))
+		}
+		remaining = next
 	}
 
 	reg, err := agentreg.New(entries)
@@ -998,6 +1004,104 @@ func buildAgents(
 		return nil, nil, nil, err
 	}
 	return reg, executors, senders, nil
+}
+
+// collectChildren 收集该 spec 的子 agent 实例。
+//
+// 第二个返回值表示「所有子都已建好」——用于拓扑序推进判定。
+// 叶子 agent（无子）恒返回 (nil, true)。
+func collectChildren(
+	spec agentSpec,
+	byName map[string]agentSpec,
+	built map[string]agent.Agent,
+) ([]agent.Agent, bool) {
+	var children []agent.Agent
+	for _, other := range byName {
+		if other.Parent != spec.Name {
+			continue
+		}
+		child, ok := built[other.Name]
+		if !ok {
+			return nil, false // 有子尚未建好，本轮跳过
+		}
+		children = append(children, child)
+	}
+	return children, true
+}
+
+// buildOne 装配单个 agent（executor + sender），并登记到各索引。
+//
+// 隔离参数取值优先级：**spec 字段 > 全局环境变量**。
+// 后者保证未配 spec 字段的 agent 行为与改动前一致（向后兼容）。
+func buildOne(
+	spec agentSpec,
+	children []agent.Agent,
+	modelCfg bootstrap.ModelConfig,
+	globalAllowTools []string,
+	permissions authz.PermissionSource,
+	toolSets []tool.ToolSet,
+	sessions session.Service,
+	logw io.Writer,
+	executors map[string]server.Executor,
+	senders map[string]channel.Sender,
+	built map[string]agent.Agent,
+	entries *[]agentreg.Entry,
+) error {
+	// N2：提示词。spec 未配则用全局。
+	instruction := spec.Instruction
+	if instruction == "" {
+		instruction = envInstruction()
+	}
+	// N3：skill 仓库根。spec 未配则用全局。
+	skillRoot := spec.Skills
+	if skillRoot == "" {
+		skillRoot = envSkillRoot()
+	}
+	// N4：MCP 工具白名单。spec 未配则用全局。
+	//
+	// 共享 toolSet 实例，用白名单隔离可见工具——不按 agent 各建一套
+	// MCP 连接（那会让连接数乘 agent 数）。
+	allowTools := spec.AllowTools
+	if len(allowTools) == 0 {
+		allowTools = globalAllowTools
+	}
+
+	ex, err := chat.NewExecutor(chat.Options{
+		Config:            modelCfg,
+		AppName:           "taiji",
+		UserID:            "feishu",
+		AgentName:         spec.Name,
+		SubAgents:         children, // N1：父子
+		SessionService:    sessions,
+		ToolSets:          toolSets,
+		AllowTools:        allowTools,
+		Permissions:       permissions,
+		MaxToolIterations: envMaxToolIterations(),
+		Instruction:       instruction,
+		SkillRoot:         skillRoot,
+		SkillToolProfile:  envSkillToolProfile(),
+		Echo:              logw,
+	})
+	if err != nil {
+		return fmt.Errorf("装配 agent %q 的执行器: %w", spec.Name, err)
+	}
+
+	// 每个 agent 一个 sender（**凭据隔离的落点**）。
+	// Sender 无 Close——SDK client 持有连接池但无需显式释放。
+	sd, err := feishu.NewSender(feishu.SenderConfig{
+		AppID:     spec.AppID,
+		AppSecret: spec.AppSecret,
+	})
+	if err != nil {
+		ex.Close()
+		return fmt.Errorf("装配 agent %q 的出站端: %w", spec.Name, err)
+	}
+
+	executors[spec.Name] = ex
+	senders[spec.Name] = sd
+	built[spec.Name] = ex.Agent()
+	*entries = append(*entries, agentreg.Entry{AppID: spec.AppID, Agent: spec.Name})
+	return nil
 }
 
 // envInstruction 读 serve 路径的系统提示。未配返回空。

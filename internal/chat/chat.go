@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -127,6 +128,17 @@ type Options struct {
 	// 且 IM 来源是只读上下文（§4.3.3）——执行工具的语义与此冲突。
 	// 需要执行能力时应显式配置，并自行评估沙箱。
 	SkillToolProfile string
+
+	// SubAgents 是本 agent 的**子 agent 列表**（N1 父子关系）。
+	//
+	// 空表示叶子 agent。非空时上游会给本 agent 的 Tools() 追加
+	// **一个** transfer_to_agent 工具（不是每子一个），模型在其中
+	// 通过 agent_name 选目标（外部依赖 trpc-agent-go 的
+	// agent/llmagent/llm_agent.go 的 getAllToolsLocked）。
+	//
+	// **名字必须唯一**：上游的 FindSubAgent(name) 按名查找，
+	// 重名会有歧义——这正是 AgentName 必须真正生效的原因（见 newAgent）。
+	SubAgents []agent.Agent
 }
 
 // logf 把日志写到 Echo（未设置则丢弃）。
