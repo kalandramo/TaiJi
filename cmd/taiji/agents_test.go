@@ -14,24 +14,56 @@ import (
 // 设计理由（与既有 TAIJI_RBAC 同形态）：单变量分号分隔条目，
 // 条目数与 agent 数同步增删，不会出现「改了 A 忘了 B」的残配置。
 
-func TestEnvAgents_UnsetFallsBackToSingle(t *testing.T) {
+// 未配置 TAIJI_AGENTS → **报错**（2026-10-02 起，此前是回退读 FEISHU_APP_ID）。
+//
+// 为什么改为报错而非回退：FEISHU_APP_ID / FEISHU_APP_SECRET 已删除，
+// 配置面收敛到 TAIJI_AGENTS 一条通道。缺配置时明确报错，
+// 好过用空凭据启动（那会在连飞书时才失败，错误指向「app_id is invalid」
+// 而非「你没配配置」，误导排查方向）。
+//
+// **同时锁住**：错误信息必须指出该写什么（否则用户不知道格式）。
+func TestEnvAgents_UnsetIsError(t *testing.T) {
 	t.Setenv("TAIJI_AGENTS", "")
-	t.Setenv("FEISHU_APP_ID", "cli_single")
-	t.Setenv("FEISHU_APP_SECRET", "sec_single")
+
+	specs, err := parseAgents()
+	if err == nil {
+		t.Fatalf("未配置 TAIJI_AGENTS 应报错，却得到 %d 个 spec", len(specs))
+	}
+	// 错误信息要能指导用户——含变量名与写法示例。
+	for _, want := range []string{"TAIJI_AGENTS", "name=", "app_id="} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误信息应含 %q 以便用户照抄，实际：%v", want, err)
+		}
+	}
+}
+
+// 旧的 FEISHU_APP_ID / FEISHU_APP_SECRET 设了也不再生效。
+//
+// 这不是「兼容层」，而是删除后的**明确语义**：那两个变量已完全移除，
+// 设了它们不会让 parseAgents 成功——避免用户以为旧配置还能用。
+func TestEnvAgents_LegacyEnvVarsNoLongerWork(t *testing.T) {
+	t.Setenv("TAIJI_AGENTS", "")
+	t.Setenv("FEISHU_APP_ID", "cli_legacy")
+	t.Setenv("FEISHU_APP_SECRET", "sec_legacy")
+
+	if _, err := parseAgents(); err == nil {
+		t.Error("旧变量 FEISHU_APP_ID/SECRET 已删除，设了也不应让 parseAgents 成功")
+	}
+}
+
+// 单 agent 与多 agent 用**同一个变量**——区别只在条目数。
+func TestEnvAgents_SingleEntryIsValidSingleAgent(t *testing.T) {
+	t.Setenv("TAIJI_AGENTS", "name=assistant,app_id=cli_one,app_secret=s1")
 
 	specs, err := parseAgents()
 	if err != nil {
-		t.Fatalf("未配置 TAIJI_AGENTS 不应报错: %v", err)
+		t.Fatalf("单条配置应解析成功: %v", err)
 	}
-	// 向后兼容：回退到单 agent（读旧变量）。
 	if len(specs) != 1 {
-		t.Fatalf("未配置时应回退为 1 个 agent，got %d", len(specs))
+		t.Fatalf("应得 1 个 spec，got %d", len(specs))
 	}
-	if specs[0].AppID != "cli_single" || specs[0].AppSecret != "sec_single" {
-		t.Errorf("回退时应读 FEISHU_APP_ID/SECRET，got %+v", specs[0])
-	}
-	if specs[0].Name != defaultAgentName {
-		t.Errorf("回退时 agent 名应为 %q，got %q", defaultAgentName, specs[0].Name)
+	if specs[0].Name != "assistant" || specs[0].AppID != "cli_one" {
+		t.Errorf("解析结果不符: %+v", specs[0])
 	}
 }
 

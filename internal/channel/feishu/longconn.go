@@ -79,7 +79,8 @@ type LongConn struct {
 func NewLongConn(cfg LongConnConfig) (*LongConn, error) {
 	if cfg.AppID == "" || cfg.AppSecret == "" {
 		return nil, fmt.Errorf(
-			"feishu: long connection requires %s and %s", EnvAppID, EnvAppSecret)
+			"feishu: long connection requires app_id and app_secret " +
+				"(configure via TAIJI_AGENTS)")
 	}
 	if cfg.newClient == nil {
 		cfg.newClient = func(appID, appSecret string, handler *larkdispatcher.EventDispatcher) wsClient {

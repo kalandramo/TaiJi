@@ -57,7 +57,8 @@ func FetchBotOpenID(ctx context.Context, appID, appSecret string) (string, error
 func FetchBotOpenIDWithBaseURL(ctx context.Context, appID, appSecret, openBaseURL string) (string, error) {
 	if strings.TrimSpace(appID) == "" || strings.TrimSpace(appSecret) == "" {
 		return "", fmt.Errorf(
-			"feishu: fetching bot open_id requires %s and %s", EnvAppID, EnvAppSecret)
+			"feishu: fetching bot open_id requires app_id and app_secret " +
+				"(configure via TAIJI_AGENTS)")
 	}
 
 	opts := []lark.ClientOptionFunc{}

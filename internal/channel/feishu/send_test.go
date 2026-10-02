@@ -183,15 +183,11 @@ func TestNewSender_RequiresCredentials(t *testing.T) {
 	}
 }
 
-func TestSenderConfigFromEnv(t *testing.T) {
-	got := SenderConfigFromEnv(map[string]string{
-		EnvAppID:     "cli_x",
-		EnvAppSecret: "sec_y",
-	})
-	if got.AppID != "cli_x" || got.AppSecret != "sec_y" {
-		t.Errorf("SenderConfigFromEnv = %+v, want AppID=cli_x AppSecret=sec_y", got)
-	}
-}
+// TestSenderConfigFromEnv 已删除（2026-10-02）：
+// 被测函数 SenderConfigFromEnv 与其依赖的 EnvAppID/EnvAppSecret 常量
+// 随配置面收敛（飞书凭据统一走 TAIJI_AGENTS）一并移除。
+// 凭据现在由 cmd/taiji 直接构造 SenderConfig{AppID: ..., AppSecret: ...} 传入，
+// 无等价的 map 转换逻辑需要单测——该链路由端到端冒烟覆盖。
 
 // ===== 创建消息（AC-1 的出站半程） =====
 

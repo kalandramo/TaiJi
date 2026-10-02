@@ -69,6 +69,56 @@ func NewMCPSets(cfgs []MCPServerConfig) ([]tool.ToolSet, error) {
 	return sets, nil
 }
 
+// DegradedServer 记录一个**连接失败但被跳过**的 MCP server。
+type DegradedServer struct {
+	Name string
+	Err  error
+}
+
+// NewMCPSetsTolerant 与 NewMCPSets 同，但把**连接失败**降级而非终止。
+//
+// 为什么需要它（serve 路径）：
+// NewMCPSets 是全或无——任一 server 连不上，整个进程启动失败。对 `chat`
+// 这种一次性命令这是对的（失败立刻可见）；但对 `serve`（长驻飞书 bot）
+// 是错的：**一个外部工具服务的网络抖动会让 bot 完全起不来**，且用户看到
+// 的是一句 MCP 报错，无法区分「bot 本身坏了」与「某个工具服务临时不可达」。
+//
+// 分层的判据是「这是谁的问题」：
+//   - **配置错误**（缺 name/url/command、重名、不支持的 transport）→ 仍
+//     fail-fast。这是笔误，越早暴露越好，且不会随时间自愈。
+//   - **连接失败**（进程起不来、远端不可达、握手超时）→ 跳过该 server，
+//     其余照常装配。返回的 failed 供调用方**大声告警**。
+//
+// 「跳过」不等于静默降级：调用方必须把 failed 打进日志（见 buildPipeline），
+// 否则用户会以为工具配好了却不生效——那正是本分层要避免的。
+//
+// 返回的 ToolSet 由调用方负责 Close；failed 中的 server 未建立任何连接。
+func NewMCPSetsTolerant(cfgs []MCPServerConfig) ([]tool.ToolSet, []DegradedServer, error) {
+	if len(cfgs) == 0 {
+		return nil, nil, nil // 无 MCP 是合法配置
+	}
+
+	// 配置错误先整体校验：这是 fail-fast 的一侧，不降级。
+	if err := validateMCPServerConfigs(cfgs); err != nil {
+		return nil, nil, err
+	}
+
+	sets := make([]tool.ToolSet, 0, len(cfgs))
+	var failed []DegradedServer
+	ctx := context.Background()
+
+	for _, c := range cfgs {
+		ts, err := buildOneMCPSet(ctx, c)
+		if err != nil {
+			// 连接失败：记下来，不下传——其余 server 继续装配。
+			failed = append(failed, DegradedServer{Name: c.Name, Err: err})
+			continue
+		}
+		sets = append(sets, ts)
+	}
+	return sets, failed, nil
+}
+
 // defaultMCPTimeout 是未配置 Timeout 时使用的连接/调用超时。
 // 上游 trpc-mcp-go 要求 timeout 必须为正数，传 0 会报
 // "invalid configuration: timeout must be positive"。

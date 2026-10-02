@@ -23,15 +23,10 @@ import (
 //
 // 长连接（LongConn）另行实现——它用 larkws，与出站正交。
 
-// EnvAppID / EnvAppSecret 是出站与长连接所需的应用凭据键名。
-//
-// 与 internal/config 的 CredentialKeys 是同一组键的两个使用点：
-// config 侧负责「工作区不得覆盖」，本包负责「从受信配置读取」。
-// 一致性由 EnsureCredentialKeysProtected 在启动期断言。
-const (
-	EnvAppID     = "FEISHU_APP_ID"
-	EnvAppSecret = "FEISHU_APP_SECRET"
-)
+// 注：FEISHU_APP_ID / FEISHU_APP_SECRET 两个环境键已于 2026-10-02 删除。
+// 飞书凭据的唯一来源是 TAIJI_AGENTS（每 agent 一条，含 app_id/app_secret）——
+// 单 agent 与多 agent 用同一通道，区别只在条目数。
+// 凭据由 cmd/taiji 的 parseAgents 解析后经 SenderConfig 传入，本包不再读环境。
 
 // Sender 是飞书出站实现。
 type Sender struct {
@@ -52,14 +47,6 @@ type SenderConfig struct {
 	OpenBaseURL string
 }
 
-// SenderConfigFromEnv 从受信配置快照构建出站配置。
-func SenderConfigFromEnv(cfg map[string]string) SenderConfig {
-	return SenderConfig{
-		AppID:     cfg[EnvAppID],
-		AppSecret: cfg[EnvAppSecret],
-	}
-}
-
 // NewSender 构造出站实现。
 //
 // 凭据缺失即报错而非构造一个「发不出去」的实例：后者会让配置错误
@@ -67,8 +54,8 @@ func SenderConfigFromEnv(cfg map[string]string) SenderConfig {
 func NewSender(cfg SenderConfig) (*Sender, error) {
 	if strings.TrimSpace(cfg.AppID) == "" || strings.TrimSpace(cfg.AppSecret) == "" {
 		return nil, fmt.Errorf(
-			"feishu: outbound requires %s and %s (set them in the startup environment)",
-			EnvAppID, EnvAppSecret)
+			"feishu: outbound requires app_id and app_secret " +
+				"(configure via TAIJI_AGENTS, e.g. name=assistant,app_id=cli_xxx,app_secret=xxx)")
 	}
 
 	opts := []lark.ClientOptionFunc{}

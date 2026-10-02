@@ -144,6 +144,9 @@ func runChat(args []string) int {
 		fmt.Fprintf(os.Stderr, "taiji chat: %v\n", err)
 		return 2
 	}
+	// chat 保持全或无（与 serve 的分层刻意不同）：
+	// 一次性命令里 MCP 连不上就该就地失败——用户就在终端前，立刻能看到
+	// 要修什么。降级只对长驻服务有意义（见 buildPipeline 里的说明）。
 	toolSets, err := bootstrap.NewMCPSets(mcpCfgs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "taiji chat: %v\n", err)
@@ -323,15 +326,14 @@ func runServe(args []string) int {
 		return 2
 	}
 
-	// 凭据链自检：本包读取的凭据键必须都受 config 层保护，
-	// 否则工作区文件可覆盖凭据（凭据劫持）。启动期暴露优于运行期发现。
-	if err := feishu.EnsureCredentialKeysProtected(); err != nil {
-		fmt.Fprintf(os.Stderr, "taiji serve: %v\n", err)
-		return 1
-	}
-
 	// ── 端到端管道装配（issue #9）──
 	// 把各层串起来：门禁 → 路由 → 串行化 → 执行 → 出站。
+	//
+	// 注：此处曾调 feishu.EnsureCredentialKeysProtected() 做凭据链自检——
+	// 它断言「本包从环境读的凭据键都受 config 层保护」。飞书凭据已收敛到
+	// TAIJI_AGENTS（单通道），本包不再从环境读凭据，该自检随之删除。
+	// TAIJI_AGENTS 自身的保护由 internal/config 的测试独立锁定
+	// （agents_test.go 的 TestReservedKeys_TAIJI_AGENTS / TestMergeWorkspaceEnv_SkipsTAIJI_AGENTS）。
 	pipeline, err := buildPipeline(loaded, os.Stderr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "taiji serve: %v\n", err)
@@ -446,9 +448,29 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	if err != nil {
 		return nil, fmt.Errorf("解析 MCP 配置: %w", err)
 	}
-	toolSets, err := bootstrap.NewMCPSets(mcpCfgs)
+	// serve 是长驻服务：**连接失败降级，配置错误仍 fail-fast**。
+	//
+	// 为什么 serve 与 chat 不同：chat 是一次性命令，MCP 连不上就地退出，
+	// 用户立刻知道要修什么；serve 挂着飞书 bot，一个外部工具服务（SSE/stdio）
+	// 的网络抖动若让整个进程起不来，表现是「bot 完全没反应」——
+	// 用户无法从一句 MCP 报错区分「bot 本身坏了」与「某个工具服务临时不可达」。
+	//
+	// 真实故障：Infraverse (sse http://10.82.138.249:31177/sse) 不可达时，
+	// taiji serve 直接退出，飞书侧完全无响应。
+	//
+	// 配置错误（缺 name/url/command、重名）不在此列——那是笔误，越早暴露越好。
+	toolSets, mcpFailed, err := bootstrap.NewMCPSetsTolerant(mcpCfgs)
 	if err != nil {
 		return nil, fmt.Errorf("装配 MCP: %w", err)
+	}
+	// 降级必须**大声**：否则用户会以为工具配好了却不生效。
+	for _, f := range mcpFailed {
+		logf("警告：MCP server %q 装配失败，已跳过（该 server 的工具本次不可用）：%v",
+			f.Name, f.Err)
+	}
+	if len(mcpFailed) > 0 {
+		logf("警告：%d/%d 个 MCP server 不可用，服务以降级模式启动。"+
+			"修复后需重启才能恢复这些工具。", len(mcpFailed), len(mcpCfgs))
 	}
 
 	// 出站：需要应用凭据换 tenant_access_token。
@@ -461,6 +483,21 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	// 漏传时白名单为空 → 所有工具被拒，而模型仍看得见工具名，
 	// 表现为「配了 MCP 却不生效」且无报错（issue #9 AC-2 的根因）。
 	allowTools := envAllowTools()
+	// 降级 server 的工具从白名单剔除——否则下游 validateAllowList 会把
+	// 「服务不可用导致工具未注册」误判为「配置笔误」而 fail-fast，
+	// 降级在第二道门被推翻（真实故障的第二段）。真拼错的名字不受影响，
+	// 仍按原样走 fail-fast。
+	if len(mcpFailed) > 0 {
+		degradedNames := make([]string, 0, len(mcpFailed))
+		for _, f := range mcpFailed {
+			degradedNames = append(degradedNames, f.Name)
+		}
+		var dropped []string
+		allowTools, dropped = dropAllowToolsOfDegradedServers(allowTools, degradedNames)
+		for _, d := range dropped {
+			logf("警告：白名单条目 %q 所属的 MCP server 不可用，本次已剔除该条目", d)
+		}
+	}
 	if len(toolSets) > 0 && len(allowTools) == 0 {
 		logf("警告：已装配 %d 个 MCP server，但 TAIJI_ALLOW_TOOLS 为空——"+
 			"工具策略默认拒绝，所有工具调用都会被拒。请显式列出要放行的工具名"+
@@ -527,17 +564,20 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	// 出站：需要应用凭据换 tenant_access_token。
 	// 放在权限校验之后——校验是纯配置检查，先暴露配置错误更省事。
 	//
-	// 多 agent 部署下的语义：真正的出站在 buildAgents 里按 agent 各建一个
-	// （凭据隔离），这个全局 sender **不会被用到**（server 按 agent 查
-	// Senders map）。但它不能为 nil——server.New 硬性要求非 nil。
-	// 故用**第一个 agent 的凭据**构造它：语义自洽（不是凭空要求用户
-	// 再配一套用不上的全局凭据），且失败时错误指向具体的 agent。
-	senderCfg := feishu.SenderConfigFromEnv(loaded)
-	if len(agentSpecs) > 1 {
-		senderCfg = feishu.SenderConfig{
-			AppID:     agentSpecs[0].AppID,
-			AppSecret: agentSpecs[0].AppSecret,
-		}
+	// **凭据一律取第一个 agent 的**（2026-10-02 起）：
+	//   - 单 agent：它就是唯一那个，即真正的出站端
+	//   - 多 agent：真正的出站在 buildAgents 里按 agent 各建一个
+	//     （凭据隔离），这个全局 sender **不会被用到**，但不能为 nil
+	//     （server.New 硬性要求）——故借第一个 agent 的凭据构造它
+	//
+	// 此前这里按 `len(agentSpecs) > 1` 二选一（多 agent 用 specs[0]、
+	// 单 agent 读 FEISHU_APP_ID/SECRET）。那两个变量已删除，配置面
+	// 收敛到 TAIJI_AGENTS 一条通道，故分支也随之消失。
+	//
+	// agentSpecs 非空由 parseAgents 保证（未配置即报错），此处不重复防御。
+	senderCfg := feishu.SenderConfig{
+		AppID:     agentSpecs[0].AppID,
+		AppSecret: agentSpecs[0].AppSecret,
 	}
 	sender, err := feishu.NewSender(senderCfg)
 	if err != nil {
@@ -621,28 +661,50 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	// 两者必须是**同一实例**——否则 /stop 取消的是另一个注册表里的 run。
 	gateCfg := gateConfigFromEnv()
 
-	// 多 agent 部署：按各 agent 的凭据取 bot open_id，构造 AppID → open_id 映射。
+	// 按各 agent 的凭据取 bot open_id，构造 AppID → open_id 映射。
 	//
-	// 为什么必须按 agent 取：每个 bot 的 open_id 不同，门禁要拿**接收该消息
-	// 的那个 bot** 的 open_id 去比对 mentions。用全局单值会让「@ bot B」被判成
-	// not_mentioned（2026-10-02 真实双 agent 同群故障）。
+	// **自动获取优先，失败回退**（2026-10-02，修正一次回归）：
 	//
-	// 为什么自动取而非让人手填：open_id 是应用维度的，手填既易错（复制粘贴
-	// 串号）又在换应用时要求同步改配置。凭据已在手，open_id 是它的函数。
+	// 设计权衡——自动获取 vs 启动可用性：
+	//   - 收益：open_id 是应用维度的，手填易错（复制粘贴串号）；
+	//     凭据已在手，open_id 是它的函数。统一自动后配置面少一项。
+	//   - 代价：`/open-apis/bot/v3/info` 是**网络调用**。若把它设为
+	//     硬依赖，则「凭据暂时失效」「离线调试」「纯私聊部署」都会
+	//     起不来——而这些场景**本不需要** open_id（只有群聊 @ 判定用）。
 	//
-	// 失败即中止：取不到 open_id 的 bot 会被门禁 fail-closed 拒绝所有群消息
-	// （表现为「bot 活着但永远不响应」），静默继续比启动失败更难排查。
-	if len(agentSpecs) > 1 {
+	// 故按 agent 数分流：
+	//   - 多 agent：**必须成功**。每个 bot 的 open_id 不同，
+	//     手填的单值无法覆盖，无退路。
+	//   - 单 agent：**失败可回退**到 TAIJI_FEISHU_BOT_OPEN_ID（若配了）。
+	//     回退后群聊 @ 判定仍可用；未配则警告（群聊消息会被门禁拒绝，
+	//     但私聊与其它功能不受影响）。
+	//
+	// 早期版本无条件 fail-fast，导致「配了 TAIJI_FEISHU_BOT_OPEN_ID
+	// 却因自动获取失败而启动不了」——那是把可选优化做成了硬依赖。
+	//
+	// 为什么必须按 agent 逐个取（多 agent 时）：每个 bot 的 open_id 不同，
+	// 门禁要拿**接收该消息的那个 bot** 的 open_id 去比对 mentions。
+	// 用全局单值会让「@ bot B」被判成 not_mentioned（真实双 agent 同群故障）。
+	{
 		botCtx, cancelBot := ctxForBotInfo()
-		mapping, err := fetchBotOpenIDs(botCtx, agentSpecs)
+		mapping, fetchErr := fetchBotOpenIDs(botCtx, agentSpecs)
 		cancelBot()
-		if err != nil {
+		// 决策抽成纯函数（decideBotOpenID）——它有两个分支三种结果，
+		// 曾因无条件 fail-fast 引入「配置正确却起不来」的回归。
+		// 抽出后可单测，见 botopenid_test.go。
+		d := decideBotOpenID(len(agentSpecs), fetchErr, gateCfg.BotOpenID)
+		if d.fatal {
 			executor.Close()
 			bootstrap.CloseMCPSets(toolSets)
-			return nil, err
+			return nil, fetchErr
 		}
-		gateCfg.BotOpenIDs = mapping
-		logf("门禁：已按 agent 取 bot open_id（%d 个）", len(mapping))
+		if d.useMapping {
+			gateCfg.BotOpenIDs = mapping
+			logf("门禁：已按 agent 取 bot open_id（%d 个）", len(mapping))
+		}
+		if d.note != "" {
+			logf("%s", d.note)
+		}
 	}
 
 	wsID := workspaceID(loaded)
@@ -770,6 +832,55 @@ func ctxForBotInfo() (context.Context, context.CancelFunc) {
 // botInfoTimeout 是单个 bot info 请求的时限。
 const botInfoTimeout = 15 * time.Second
 
+// botOpenIDDecision 是「bot open_id 获取失败时怎么办」的决策结果。
+//
+// 抽成数据结构而非直接 log/return，是为了让决策可单测——
+// 这个决策曾因「无条件 fail-fast」引入「配置正确却起不来」的回归
+// （见 botopenid_test.go 的说明）。
+//
+// **只表达「怎么办」，不携带数据**：映射由调用方在成功分支直接使用。
+// 早期版本让本结构持有 mapping，会用空 map 表示「成功」——
+// 而空 map 与「映射存在但无条目」在门禁侧含义不同
+// （后者会让所有 AppID 都解析失败），是个危险的歧义。
+type botOpenIDDecision struct {
+	// fatal 表示必须中止启动。
+	fatal bool
+	// useMapping 表示「用刚获取到的映射」（仅成功时为真）。
+	useMapping bool
+	// note 非空时记日志（回退提示或警告）。
+	note string
+}
+
+// decideBotOpenID 决定 bot open_id 获取失败（或成功）后如何处理。
+//
+// 策略（按 agent 数分流）：
+//
+//	获取成功                        → useMapping（用刚取到的映射）
+//	多 agent + 失败                 → fatal（手填单值服务不了多个 bot）
+//	单 agent + 失败 + 有手填值      → 回退（群聊 @ 判定仍可用）
+//	单 agent + 失败 + 无手填值      → 警告（群聊会被拒，私聊不受影响）
+//
+// **为什么单 agent 不 fail-fast**：`/open-apis/bot/v3/info` 是网络调用。
+// 设为硬依赖会让「凭据暂时失效」「离线调试」「纯私聊部署」都起不来——
+// 而这些场景本不需要 open_id（只有群聊 @ 判定用）。
+// 多 agent 无退路（每个 bot 的 open_id 不同，手填的单值不够），故必须 fatal。
+func decideBotOpenID(specCount int, fetchErr error, manualOpenID string) botOpenIDDecision {
+	if fetchErr == nil {
+		return botOpenIDDecision{useMapping: true}
+	}
+	if specCount > 1 {
+		return botOpenIDDecision{fatal: true}
+	}
+	if manualOpenID != "" {
+		return botOpenIDDecision{note: fmt.Sprintf(
+			"提示：自动获取 bot open_id 未成功（%v）；"+
+				"已回退 TAIJI_FEISHU_BOT_OPEN_ID（群聊 @ 判定仍可用）", fetchErr)}
+	}
+	return botOpenIDDecision{note: fmt.Sprintf(
+		"警告：未能获取 bot open_id（%v），且未配置 TAIJI_FEISHU_BOT_OPEN_ID——"+
+			"群聊消息将被拒绝（@ 判定无基准），私聊不受影响", fetchErr)}
+}
+
 // fetchBotOpenIDs 按各 agent 的凭据取 bot open_id，返回 AppID → open_id 映射。
 //
 // 用于门禁的 per-agent @ 判定（每个 bot 的 open_id 不同）。
@@ -848,8 +959,51 @@ func envAllowTools() []string {
 	return out
 }
 
-// runLongConn 以长连接模式运行（issue #9 Wave 5，AC-6）。
+// dropAllowToolsOfDegradedServers 从白名单里剔除属于**已降级 server** 的条目。
 //
+// 为什么需要：MCP server 连接失败被跳过后（见 buildPipeline 的降级逻辑），
+// 它的工具不再注册。若白名单里仍有 `{server}_tool` 形式的条目，
+// 下游的 validateAllowList 会判「未注册」并 fail-fast——
+// 于是「降级」在第二道门又被推翻，服务照样起不来（真实故障的第二段）。
+//
+// 判据是**前缀归属**，不是「名字不存在」：
+//   - 条目属于某个被跳过的 server（前缀 `{name}_`）→ 剔除（该工具本次不可用，
+//     是服务的问题，不是配置的问题；修复后重启即恢复）
+//   - 其余条目一律保留——包括**拼错**的名字。它们仍会走 validateAllowList
+//     的 fail-fast，因为那是配置笔误，越早暴露越好（与降级分层同一判据）。
+//
+// 返回剔除后的白名单与被剔除的条目（供调用方告警）。
+func dropAllowToolsOfDegradedServers(allow []string, degraded []string) (kept, dropped []string) {
+	if len(allow) == 0 || len(degraded) == 0 {
+		return allow, nil
+	}
+	prefixes := make([]string, 0, len(degraded))
+	for _, name := range degraded {
+		if name = strings.TrimSpace(name); name != "" {
+			prefixes = append(prefixes, name+"_")
+		}
+	}
+	kept = make([]string, 0, len(allow))
+	for _, name := range allow {
+		if matchesAnyPrefix(name, prefixes) {
+			dropped = append(dropped, name)
+			continue
+		}
+		kept = append(kept, name)
+	}
+	return kept, dropped
+}
+
+// matchesAnyPrefix 报告 s 是否以 prefixes 之一开头。
+func matchesAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // 与 webhook 模式的关键差异：
 //   - 无 HTTP 端点、无验签（§2.2：长连接不需要 verificationToken/encryptKey）
 //   - 入站由 SDK 回调直出，投递给同一个 dispatcher（去重 + 异步处理）
@@ -873,9 +1027,10 @@ func runLongConn(loaded map[string]string, pipeline *pipelineHolder, dispatcher 
 	for _, spec := range specs {
 		if spec.AppID == "" || spec.AppSecret == "" {
 			fmt.Fprintf(os.Stderr,
-				"taiji serve: agent %q 缺少飞书凭据（%s / %s）。\n"+
-					"凭据只从启动环境读（见设计文档 §4.6）。\n",
-				spec.Name, feishu.EnvAppID, feishu.EnvAppSecret)
+				"taiji serve: agent %q 缺少飞书凭据。\n"+
+					"%s 的该条目需含 app_id 与 app_secret，"+
+					"如 name=%s,app_id=cli_xxx,app_secret=xxx\n",
+				spec.Name, envAgentsKey, spec.Name)
 			for _, c := range conns {
 				c.Stop()
 			}

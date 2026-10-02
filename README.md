@@ -21,12 +21,14 @@ $env:TAIJI_MODEL_API_KEY  = "sk-xxxxxxxx"
 $env:TAIJI_MODEL_BASE_URL = "https://api.example.com/v1"   # ⚠ 必须自带 /v1
 
 # ── 飞书（必填）──
-$env:FEISHU_APP_ID            = "cli_xxxxxxxxxxxx"
-$env:FEISHU_APP_SECRET        = "xxxxxxxxxxxxxxxx"
-$env:TAIJI_FEISHU_BOT_OPEN_ID = "ou_xxxxxxxxxxxx"
+# agent 与凭据的唯一入口；单 agent 写一条。
+$env:TAIJI_AGENTS = "name=assistant,app_id=cli_xxxxxxxxxxxx,app_secret=xxxxxxxxxxxxxxxx"
 
 .\taiji.exe serve --feishu-mode=longconn
 ```
+
+> bot 的 `open_id`（群聊 @ 判定用）启动时**自动获取**，
+> 无需手填——除非自动获取失败（单 agent 可回退 `TAIJI_FEISHU_BOT_OPEN_ID`）。
 
 **完整部署指引（含排障）**：`docs/15-Windows本地开发部署.md`
 **环境变量清单**：`docs/13-环境变量清单.md`

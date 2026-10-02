@@ -69,13 +69,21 @@ $env:TAIJI_MODEL_NAME     = "deepseek-chat"
 $env:TAIJI_MODEL_API_KEY  = "sk-xxxxxxxx"
 $env:TAIJI_MODEL_BASE_URL = "https://api.example.com/v1"   # ⚠ 必须自带 /v1
 
-# ── 飞书应用凭据（必填）──
-$env:FEISHU_APP_ID     = "cli_xxxxxxxxxxxx"
-$env:FEISHU_APP_SECRET = "xxxxxxxxxxxxxxxxxxxxxxxx"
+# ── 飞书（必填）──
+# agent 与凭据的唯一入口。单 agent 写一条即可。
+$env:TAIJI_AGENTS = "name=assistant,app_id=cli_xxxxxxxxxxxx,app_secret=xxxxxxxxxxxxxxxx"
 
-# ── 群聊 @ 判定基准（必填，否则群消息全被拒）──
-$env:TAIJI_FEISHU_BOT_OPEN_ID = "ou_xxxxxxxxxxxx"
+# ── 群聊 @ 判定基准（可选）──
+# 启动时会自动按上面的凭据调飞书 API 取 open_id；
+# 自动获取失败时才用本值（单 agent）。多 agent 无退路，失败即拒绝启动。
+# $env:TAIJI_FEISHU_BOT_OPEN_ID = "ou_xxxxxxxxxxxx"
 ```
+
+> ### ⚠ 变更提示（2026-10-02）
+>
+> `FEISHU_APP_ID` / `FEISHU_APP_SECRET` **已删除**，飞书凭据统一走
+> `TAIJI_AGENTS`（单 agent 也用它，写一条）。设旧变量不再生效——
+> 启动会报 `TAIJI_AGENTS 未配置`。
 
 > ### ⚠ `TAIJI_MODEL_BASE_URL` 必须自带 `/v1`
 >
@@ -153,11 +161,11 @@ taiji serve: 长连接已启动（2 条，无需公网入口）
 
 **关键差异**：多 agent 时
 
-- **不必设** `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（除非全局 sender 需要，
-  见 §7.2）
+- **不必额外设凭据**——`TAIJI_AGENTS` 多条即含各 agent 的 `app_id`/`app_secret`
 - **不必设** `TAIJI_FEISHU_BOT_OPEN_ID`——启动时会按各 agent 凭据自动调
   `/open-apis/bot/v3/info` 取 `open_id`（`门禁：已按 agent 取 bot open_id（N 个）`）
-- 取不到即**中止启动**并点名是哪个 agent
+- 多 agent 下自动获取失败即**中止启动**并点名是哪个 agent
+  （无退路：每个 bot 的 open_id 不同，手填单值服务不了）
 
 **每 agent 可选字段**（写在同一行，逗号分隔）：
 
@@ -286,23 +294,33 @@ TAIJI_MCP_SERVERS="mock=.\mockmcp.exe"   →  工具名是 mock_echo（不是 ec
 
 以下错误信息均为**实测原文**。
 
-### 7.1 缺飞书凭据
+### 7.1 缺飞书配置
 
 ```
-taiji serve: feishu: outbound requires FEISHU_APP_ID and FEISHU_APP_SECRET (set them in the startup environment)
+taiji serve: TAIJI_AGENTS 未配置——它是 agent 与飞书凭据的**唯一**配置入口。单 agent 写法：TAIJI_AGENTS="name=assistant,app_id=<你的app_id>,app_secret=<你的app_secret>"
 ```
 
-**exit=1**。设 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（多 agent 时改设 `TAIJI_AGENTS`）。
+**exit=1**。按提示设 `TAIJI_AGENTS`（单 agent 写一条）。
 
-### 7.2 多 agent 仍要求全局凭据
+> 设了旧的 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 也**同样报这个错**——
+> 那两个变量已删除，配置面已收敛到 `TAIJI_AGENTS`。
 
-多 agent 配置完整，却报同样的错——这是**已知的装配顺序**：
-`buildPipeline` 会构造一个全局 sender（多 agent 下**不会被用到**，但
-`server.New` 要求非 nil）。
+条目字段缺失时报错**点名是哪个 agent 与哪个字段**（实测）：
 
-**处置**：多 agent 时**顺手也设上** `FEISHU_APP_ID` / `FEISHU_APP_SECRET`
-（填任意一个 agent 的凭据即可，反正不用）。这是配置面的冗余要求，
-不是功能缺陷。
+```
+taiji serve: TAIJI_AGENTS 配置错误：agent "assistant" 缺少 app_secret
+```
+
+### 7.2 曾经的一处装配冗余（已修复）
+
+**历史问题**：多 agent 配置完整，却仍报
+`feishu: outbound requires FEISHU_APP_ID and FEISHU_APP_SECRET`。
+原因是 `buildPipeline` 会无条件构造一个全局 sender，而它的凭据来自
+那两个全局变量（多 agent 下该 sender **不会被用到**）。
+
+**现状**（2026-10-02）：全局 sender 的凭据**一律取第一个 agent 的**
+（`agentSpecs[0]`），不再读环境变量——与该问题相关的分支与其
+配置要求都已消失。若仍遇到该报错，说明跑的是旧二进制。
 
 ### 7.3 缺模型配置
 
@@ -385,7 +403,7 @@ TAIJI_WORKSPACE_ID 环境变量  >  工作区文件的 WORKSPACE_NAME  >  "defau
 | 类别 | 键 |
 |---|---|
 | 控制值 | `TAIJI_INSTRUCTION`、`TAIJI_SKILLS_ROOT`、`TAIJI_SKILL_TOOL_PROFILE`、`TAIJI_AGENTS` |
-| 凭据 | `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_VERIFICATION_TOKEN`、`FEISHU_ENCRYPT_KEY` |
+| 凭据 | **当前为空**（2026-10-02）。`TAIJI_AGENTS`（唯一凭据载体）在控制值行 |
 | 前缀族 | `TAIJI_MCP_HEADERS_*` |
 | 历史遗留（保留作保护基线） | `MODEL_ROUTE`、`EXECUTION_MODE`、`SANDBOX_POLICY`、`CREDENTIAL_REF`、`MCP_SERVERS`、`TOOL_POLICY` |
 
@@ -402,9 +420,9 @@ $env:TAIJI_MODEL_API_KEY  = "sk-xxxxxxxx"
 $env:TAIJI_MODEL_BASE_URL = "https://api.example.com/v1"
 
 # ── 2. 飞书（单 agent）──
-$env:FEISHU_APP_ID            = "cli_xxxxxxxxxxxx"
-$env:FEISHU_APP_SECRET        = "xxxxxxxxxxxxxxxx"
-$env:TAIJI_FEISHU_BOT_OPEN_ID = "ou_xxxxxxxxxxxx"
+# agent 与凭据的唯一入口；单 agent 写一条。
+$env:TAIJI_AGENTS = "name=assistant,app_id=cli_xxxxxxxxxxxx,app_secret=xxxxxxxxxxxxxxxx"
+# bot open_id 启动时自动获取，无需手填（失败时才回退 TAIJI_FEISHU_BOT_OPEN_ID）
 
 # ── 3. 工具 ──
 $env:TAIJI_MCP_SERVERS = "mock=.\mockmcp.exe"

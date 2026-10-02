@@ -13,12 +13,6 @@ import (
 // （对比 TAIJI_AGENT_<name>_APP_ID 的形态需加 ReservedPrefixes）。
 const envAgentsKey = "TAIJI_AGENTS"
 
-// defaultAgentName 是单 agent（未配 TAIJI_AGENTS）时的 agent 名。
-//
-// 与 TaiJi/internal/chat/execute.go 里 llmagent.New 的硬编码名一致，
-// 保证既有部署升级后 agent 名不变。
-const defaultAgentName = "assistant"
-
 // agentSpec 是一个 agent 的配置（名 + 凭据 + 隔离参数）。
 type agentSpec struct {
 	// Name 是 agent 标识，用于日志与执行层选择。
@@ -45,14 +39,21 @@ type agentSpec struct {
 	AllowTools []string
 }
 
-// parseAgents 解析 TAIJI_AGENTS（多 agent 配置）。
+// parseAgents 解析 TAIJI_AGENTS（agent 配置）。
 //
 // 格式：分号分隔 agent，逗号分隔字段（name / app_id / app_secret）：
 //
-//	TAIJI_AGENTS="name=billing,app_id=cli_aaa,app_secret=s1;name=ops,app_id=cli_bbb,app_secret=s2"
+//	单 agent： TAIJI_AGENTS="name=assistant,app_id=cli_aaa,app_secret=s1"
+//	多 agent： TAIJI_AGENTS="name=root,app_id=cli_aaa,app_secret=s1;name=bill,app_id=cli_bbb,app_secret=s2"
 //
-// 未配置时**回退到单 agent**（读旧的 FEISHU_APP_ID / FEISHU_APP_SECRET）——
-// 保证既有部署零改动（向后兼容）。这是本函数最重要的不变量。
+// **单 agent 与多 agent 是同一个配置面**——区别只在条目数。
+// 下游按 `len(specs) > 1` 判别（见 buildAgents），故配一条即单 agent，
+// 无需另一套变量。
+//
+// 未配置即返回 error（2026-10-02 起）——此前回退读 FEISHU_APP_ID /
+// FEISHU_APP_SECRET，那两个变量已删除，配置面收敛到本变量一条通道。
+// 缺配置时**明确报错**而非静默用空凭据启动：后者会在连飞书时才失败，
+// 且错误指向「app_id is invalid」而非「你没配配置」，误导排查方向。
 //
 // 配置有误即返回 error（fail-fast）——错误信息**指出是哪个 agent**，
 // 否则多 agent 下用户不知道哪条写错了。与 envRBAC 的取向一致：
@@ -60,7 +61,10 @@ type agentSpec struct {
 func parseAgents() ([]agentSpec, error) {
 	raw := strings.TrimSpace(os.Getenv(envAgentsKey))
 	if raw == "" {
-		return []agentSpec{singleAgentFromLegacyEnv()}, nil
+		return nil, fmt.Errorf(
+			"%s 未配置——它是 agent 与飞书凭据的**唯一**配置入口。"+
+				"单 agent 写法：%s=\"name=assistant,app_id=<你的app_id>,app_secret=<你的app_secret>\"",
+			envAgentsKey, envAgentsKey)
 	}
 
 	var specs []agentSpec
@@ -232,13 +236,4 @@ func splitPipeList(v string) []string {
 		}
 	}
 	return out
-}
-
-// singleAgentFromLegacyEnv 从旧环境变量构造单 agent（向后兼容路径）。
-func singleAgentFromLegacyEnv() agentSpec {
-	return agentSpec{
-		Name:      defaultAgentName,
-		AppID:     strings.TrimSpace(os.Getenv("FEISHU_APP_ID")),
-		AppSecret: strings.TrimSpace(os.Getenv("FEISHU_APP_SECRET")),
-	}
 }

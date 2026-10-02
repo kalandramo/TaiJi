@@ -41,17 +41,19 @@ var ReservedKeys = map[string]struct{}{
 //
 // 但两者的防护动作相同（工作区提供的同名键一律跳过），故在检查点合并。
 //
-// 依据：设计文档 §4.4.2 要求凭据来自受信启动环境（NFR-9.1）；
-// 03-原型设计文档.md:917 的配置约定「所有凭据走环境变量，配置文件不落密钥」。
-var CredentialKeys = map[string]struct{}{
-	// 飞书 webhook 验签口令（#5）
-	"FEISHU_VERIFICATION_TOKEN": {},
-	// 飞书事件解密口令（#5）
-	"FEISHU_ENCRYPT_KEY": {},
-	// 飞书应用凭据（#9 出站与长连接使用）
-	"FEISHU_APP_ID":     {},
-	"FEISHU_APP_SECRET": {},
-}
+// **当前为空**（2026-10-02）：四个原成员已全部移除——
+//   - FEISHU_APP_ID / FEISHU_APP_SECRET：飞书凭据收敛到 TAIJI_AGENTS
+//     （单通道，单/多 agent 同一配置面）。它们不再从环境单独读取。
+//   - FEISHU_VERIFICATION_TOKEN / FEISHU_ENCRYPT_KEY：webhook 形态专属，
+//     该形态已移除，两个键当前无任何读取方。
+//
+// 保留本变量（而非删除）作为**将来新增渠道凭据的挂点**——
+// isReserved 已在引用它，加键即生效，无需改动合并逻辑。
+//
+// **代价（明示）**：将来重加 webhook 时，需要重新发现「验签口令属凭据、
+// 必须受工作区保护」这一点。此前保留那两个键正是为此——本次一并清空，
+// 是明确取舍（用户确认：单用户使用，接受该代价）。
+var CredentialKeys = map[string]struct{}{}
 
 // ReservedPrefixes 是按键**前缀**保护的集合。
 //

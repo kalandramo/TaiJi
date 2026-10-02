@@ -171,17 +171,38 @@ setx TAIJI_MCP_HEADERS_github "Authorization:Bearer ghp_xxx;X-Api-Key:abc123"
 
 **代价**：配置 MCP 时必须同时配白名单，多一步操作。这是刻意的取舍——「配了 MCP 就能跑任意工具」的风险高于「多配一个变量」的成本。
 
-### 4.2 MCP 装配是启动期阻塞且 fail-fast
+### 4.2 MCP 装配失败的处理（2026-10-02 起分层）
 
-若 MCP server 起不来，**整个进程启动失败**：
+**原行为**（issue #3 AC-3）：任一 server 起不来 → **整个进程启动失败**。
+**现行为**：按失败**类型**分层——
+
+| 失败类型 | 例子 | 行为 |
+|---|---|---|
+| **配置错误** | 缺 name / url / command、重名、不支持的 transport | **fail-fast**（不变） |
+| **连接失败** | 进程起不来、远端不可达、握手超时 | **跳过该 server**，其余照常装配 |
+
+**为什么改**：原设计对 `chat`（一次性命令）是对的——失败立刻可见；
+但对 `serve`（长驻飞书 bot）是错的：**一个外部工具服务的网络抖动会让
+飞书 bot 完全起不来**，而用户只看到一句 MCP 报错，无法区分「bot 本身坏了」
+与「某个工具服务临时不可达」。真实故障：Infraverse SSE 不可达时，
+`taiji serve` 直接退出，飞书侧完全无响应。
+
+**降级不是静默**——启动时会打出：
 
 ```
-taiji serve: 装配 MCP: mcp server "mockmcp" (stdio command=...): failed to connect to MCP server
+[pipeline] 警告：MCP server "Infraverse" 装配失败，已跳过（该 server 的工具本次不可用）：...
+[pipeline] 警告：1/1 个 MCP server 不可用，服务以降级模式启动。修复后需重启才能恢复这些工具。
+[pipeline] 警告：白名单条目 "Infraverse_infraverse_dce_ip" 所属的 MCP server 不可用，本次已剔除该条目
 ```
 
-依据 issue #3 AC-3 的 fail-fast 要求。
+第三行是**降级语义的延伸**：`TAIJI_ALLOW_TOOLS` 里属于该 server 的条目
+会被自动剔除，否则下游 `validateAllowList` 会把「服务不可用导致工具未注册」
+误判为「配置笔误」而 fail-fast，降级在第二道门被推翻。
+**真拼错的名字不受影响**——仍走 fail-fast（判据是前缀归属，不是名字是否存在）。
 
-**代价**：配一个挂掉的 MCP server 会让飞书 bot 完全起不来，而不是「工具不可用但 bot 正常」。**收益**：不会让你误以为 bot 在正常工作。
+> **代价**：降级期间该 server 的工具不可用，需重启才能恢复；
+> 且进程活着不代表所有工具都好用——**要看启动日志的警告**。
+> **收益**：工具服务抖动不再让 bot 整体失联，可先保通信与其它工具。
 
 ### 4.3 认证头的前缀保护
 
@@ -625,7 +646,7 @@ TAIJI_ALLOW_ALL_USERS=1
 | 认证方式 | **仅静态 token/API key**。per-request 动态 token（用户级 OAuth）SDK 支持（`WithMCPOptions` + `mcp.WithHTTPBeforeRequest`），但需从请求上下文传身份，未实现 |
 | 远程 MCP 真实服务验证 | 仅本地假 server 的端到端实测；未在 GitHub MCP 等真实托管服务上验证 |
 | 退出噪声 | stdio MCP 退出时报 `failed to kill process: invalid argument`（Windows 特有 SDK 噪声），不影响功能 |
-| 装配失败行为 | fail-fast（整个进程起不来），非「降级为无工具」 |
+| 装配失败行为 | **分层**（2026-10-02）：配置错误 fail-fast；连接失败降级跳过（见 §4.2）。`chat` 路径仍全或无 |
 
 ---
 
