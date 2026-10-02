@@ -164,13 +164,15 @@ func runChat(args []string) int {
 	// 会让 CLI 的所有工具调用被拒（实测确认的静默失效）。
 	// Options.Permissions 的注释本就写明 CLI 属「nil」场景。
 	//
-	// 若用户设了任一权限变量（误以为对 CLI 生效），显式提示而非静默忽略——
+	// 若用户设了权限配置（误以为对 CLI 生效），显式提示而非静默忽略——
 	// 否则「配了却不生效」又是一个静默缺口。
 	// 这里只判断「是否配了」，不校验（CLI 不消费权限，配置错误留待 serve 暴露）。
-	if strings.TrimSpace(os.Getenv("TAIJI_RBAC")) != "" ||
-		strings.TrimSpace(os.Getenv("TAIJI_USER_PERMISSIONS")) != "" {
+	//
+	// 只认 TAIJI_RBAC：TAIJI_USER_PERMISSIONS 已于 2026-09-26 退役，
+	// 探测它没有意义（设了也无效，且没有迁移价值——它本就不对 CLI 生效）。
+	if strings.TrimSpace(os.Getenv("TAIJI_RBAC")) != "" {
 		fmt.Fprintf(os.Stderr,
-			"taiji chat: 注意——用户级权限配置（TAIJI_RBAC / TAIJI_USER_PERMISSIONS）"+
+			"taiji chat: 注意——用户级权限配置（TAIJI_RBAC）"+
 				"对 CLI 无效（权限按 IM 主体判定，CLI 无 IM 身份）。该配置仅 serve 生效。\n")
 	}
 
@@ -483,11 +485,6 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	//
 	// RBAC 配置有误（引用未定义角色）时 resolvePermissions 返回 error，
 	// 同样 fail-fast——否则该用户会被静默拒绝（「配了却不生效」）。
-	//
-	// 老变量 TAIJI_USER_PERMISSIONS 已退役，此处仅告警（不读值）。
-	if w := retiredUserPermissionsWarning(); w != "" {
-		logf("%s", w)
-	}
 	permissions, err := resolvePermissions()
 	if err != nil {
 		bootstrap.CloseMCPSets(toolSets)
@@ -961,34 +958,12 @@ func registeredToolNamesHint(cfgs []bootstrap.MCPServerConfig) []string {
 	return serverNames(cfgs)
 }
 
-// envUserPermissionsRetired 是已退役的用户级权限表环境变量名。
-//
-// 保留这个常量只为**检测用户还在用它**并给出迁移提示——其值不再被读取。
-// 退役日期：2026-09-26，由 TAIJI_RBAC 取代。
-const envUserPermissionsRetired = "TAIJI_USER_PERMISSIONS"
-
-// retiredUserPermissionsWarning 返回已退役配置的迁移提示（无则空串）。
-//
-// 设计为纯函数（返回文本而非直接打印）：调用方的 logf 是 buildPipeline
-// 内的局部闭包，包级函数够不到；且纯函数便于测试。
-//
-// 为什么必须提示而不能静默忽略：TAIJI_USER_PERMISSIONS 退役后，
-// 老部署升级会遇到两种结果，且都难与「配置写错」区分——
-//   - 没配 RBAC → 用户级权限整体消失 → serve 拒绝启动（有工具时）；
-//   - 配了 ALLOW_ALL_USERS=1 → 变成任何人可用所有工具。
-//
-// 显式警告把「静默失效」转为「有声失效」。这是项目取向的延续
-// （见 issue #9 教训：静默失效最难排查）。
-func retiredUserPermissionsWarning() string {
-	if strings.TrimSpace(os.Getenv(envUserPermissionsRetired)) == "" {
-		return ""
-	}
-	return fmt.Sprintf(
-		"警告：%s 已退役（被 TAIJI_RBAC 取代），其值**不再生效**。"+
-			"请改用 TAIJI_RBAC，例如："+
-			"role:operator=<工具名1>,<工具名2>;user:<主体ID>=operator",
-		envUserPermissionsRetired)
-}
+// 注：TAIJI_USER_PERMISSIONS 已于 2026-09-26 退役（由 TAIJI_RBAC 取代）。
+// 其**值**早已不被读取；曾有的迁移告警已于 2026-10-02 移除——
+// 旧变量残留的每种场景都已有独立信号，无需重复提示：
+//   - 有工具但没配 RBAC → serve 拒绝启动，错误已指向 TAIJI_RBAC
+//   - 配了 TAIJI_ALLOW_ALL_USERS=1 → 启动日志已有「显式放开」提示
+//   - 无工具 → 权限本就不参与判定
 
 // defaultMaxToolIterations 是工具调用轮次上限的默认值。
 //

@@ -423,30 +423,19 @@ func TestUserPermissions_EnvParserRemoved(t *testing.T) {
 	}
 }
 
-// 设了退役变量时，必须给出告警（不能静默忽略）。
+// 设了退役变量时，**不再有任何提示**（2026-10-02 移除）。
 //
-// 为什么重要：老部署升级后若只设 TAIJI_USER_PERMISSIONS，
-// 用户级权限会整体消失——没告警就无从察觉，属于静默失效。
-func TestUserPermissions_RetiredWarning(t *testing.T) {
-	t.Setenv("TAIJI_USER_PERMISSIONS", "ws1:feishu:ou_alice=mockmcp_echo")
-	w := retiredUserPermissionsWarning()
-	if w == "" {
-		t.Fatal("设了退役变量应给出告警（否则静默失效）")
-	}
-	for _, want := range []string{"TAIJI_USER_PERMISSIONS", "退役", "TAIJI_RBAC"} {
-		if !strings.Contains(w, want) {
-			t.Errorf("告警应包含 %q，实际：%s", want, w)
-		}
-	}
-}
-
-// 未设退役变量时不应有告警（避免噪声）。
-func TestUserPermissions_NoWarningWhenUnset(t *testing.T) {
-	t.Setenv("TAIJI_USER_PERMISSIONS", "")
-	if w := retiredUserPermissionsWarning(); w != "" {
-		t.Errorf("未设退役变量不应告警，实际：%s", w)
-	}
-}
+// 原 TestUserPermissions_RetiredWarning / _NoWarningWhenUnset 已删除——
+// 它们断言的是「必须告警」，而该告警已被移除。
+//
+// 为什么可以移除：旧变量残留的每种场景都已有独立信号——
+//   - 有工具但没配 RBAC → serve 拒绝启动，错误指向 TAIJI_RBAC
+//   - 配了 TAIJI_ALLOW_ALL_USERS=1 → 启动日志已有「显式放开」提示
+//   - 无工具 → 权限本就不参与判定
+// 故这条提示是 UX 便利而非安全网，移除不引入静默失效。
+//
+// **保留下面的不变量测试**：退役的核心语义是「旧变量不再授权」，
+// 与提示无关——那条必须一直锁着。
 
 // 退役变量的值**不再影响**权限判定——只设它（不设 RBAC）时无权限源。
 //
