@@ -64,6 +64,13 @@ type GateConfig struct {
 	Activation channel.ActivationMode
 	Audience   channel.AudienceMode
 	BotOpenID  string
+
+	// BotOpenIDs 按飞书应用 ID 索引各 bot 的 open_id（多 agent 部署）。
+	//
+	// 非 nil 时门禁以它为准（见 channel.GateInput.BotOpenIDs）——
+	// 每个 bot 的 open_id 不同，全局单值会让「@ bot B」被判成 not_mentioned。
+	// 单 agent 部署保持 nil，走 BotOpenID 回退。
+	BotOpenIDs map[string]string
 	Owners     []string
 }
 
@@ -322,7 +329,12 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 		Audience:   p.gate.Audience,
 		Activation: p.gate.Activation,
 		ChatType:   msg.ChatType,
+		// AppID 决定用哪个 bot 的 open_id 做 @ 判定（多 agent 部署）。
+		// 取自消息自身，不依赖分流结果——故门禁仍可保持在最前，
+		// 「顺序即语义」的安全边界不变。
+		AppID:      msg.AppID,
 		BotOpenID:  p.gate.BotOpenID,
+		BotOpenIDs: p.gate.BotOpenIDs,
 		SenderID:   msg.UserID,
 		Mentions:   msg.Mentions,
 		Owners:     p.gate.Owners,

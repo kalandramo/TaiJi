@@ -49,8 +49,28 @@ type GateInput struct {
 	// ChatType 决定是否走 @ 逻辑（私聊无 @ 概念）。
 	ChatType ChatType
 
+	// AppID 是**接收本条消息的飞书应用 ID**（事件头的 Header.AppID）。
+	//
+	// 多 agent 部署下用它查 BotOpenIDs 得到该 bot 自己的 open_id——
+	// 每个 bot 的 open_id 不同，用全局单值会让「@ bot B」被判成
+	// not_mentioned（2026-10-02 真实双 agent 同群运行的故障）。
+	//
+	// 单 agent 部署下不参与判定（BotOpenIDs 为 nil 时走 BotOpenID 回退）。
+	AppID string
+
 	// BotOpenID 是 bot 自身的平台 ID。群聊下未知 → 拒绝（fail-closed）。
+	//
+	// **单 agent 回退路径**：BotOpenIDs 为 nil 时用它。既有部署
+	// （未配 TAIJI_AGENTS）行为不变。
 	BotOpenID string
+
+	// BotOpenIDs 按飞书应用 ID 索引各 bot 的 open_id（多 agent 部署）。
+	//
+	// 非 nil 时**以它为准**（不再看 BotOpenID）：
+	//   - AppID 命中 → 用该 bot 的 open_id 比对 mentions
+	//   - AppID 未命中或值为空 → 拒绝（fail-closed，不落到全局值——
+	//     落到全局值会让未注册的 bot 借用别人的身份通过门禁）
+	BotOpenIDs map[string]string
 
 	// SenderID 是发送者的规范化 ID（owner 比对用）。
 	SenderID string
@@ -97,13 +117,18 @@ func EvaluateGate(in GateInput) Decision {
 	// 4. botOpenID 未知 → 拒绝。
 	//    这是 fail-closed 的核心：旧实现"安全降级=默认放行"导致
 	//    require_mention 在所有群静默失效。宁可拒绝并告警，不可静默放行。
-	if in.BotOpenID == "" {
+	//
+	//    多 agent 部署下按 AppID 解析（每个 bot 的 open_id 不同）：
+	//    BotOpenIDs 非 nil 时以它为准，未命中即拒——不落回全局 BotOpenID，
+	//    否则未注册的 bot 能借用别人的身份通过门禁。
+	botOpenID, ok := in.resolveBotOpenID()
+	if !ok {
 		return reject(ReasonBotOpenIDMissing)
 	}
 
 	// 5. 未 @ bot → 拒绝。比对 mentions 元数据的 OpenID，
 	//    绝不用文本匹配（用户手写 @name 会误判）。
-	if !isBotMentioned(in.BotOpenID, in.Mentions) {
+	if !isBotMentioned(botOpenID, in.Mentions) {
 		return reject(ReasonNotMentioned)
 	}
 
@@ -123,6 +148,32 @@ func EvaluateGate(in GateInput) Decision {
 // 新渠道不应因缺少配置而敞开。
 func (in GateInput) IsOwner(senderID string) bool {
 	return authz.IsOwner(in.Owners, senderID)
+}
+
+// resolveBotOpenID 解析「本 bot 的 open_id」。
+//
+// 两种形态，按 BotOpenIDs 是否为 nil 分流：
+//
+//  1. 多 agent（BotOpenIDs 非 nil）：按 AppID 查表。命中且非空 → 用它；
+//     未命中或空值 → ok=false（fail-closed）。
+//     **不回落全局 BotOpenID**——那会让未注册的 bot 借用别人的身份。
+//
+//  2. 单 agent（BotOpenIDs 为 nil）：用全局 BotOpenID，与改动前完全一致。
+//
+// 返回值 ok=false 表示「无法确定本 bot 的身份」，调用方应拒绝。
+func (in GateInput) resolveBotOpenID() (string, bool) {
+	if in.BotOpenIDs == nil {
+		if in.BotOpenID == "" {
+			return "", false
+		}
+		return in.BotOpenID, true
+	}
+	// 映射表存在：只认表，且必须命中非空值。
+	openID, found := in.BotOpenIDs[in.AppID]
+	if !found || openID == "" {
+		return "", false
+	}
+	return openID, true
 }
 
 // isBotMentioned 在 mentions 元数据里查找 bot 的 OpenID。

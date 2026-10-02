@@ -142,3 +142,114 @@ bill 工具面 = [skill_list_docs skill_load skill_select_docs]  ← 子有 skil
 - MCP 的「连都不连」隔离：当前**共享 toolSet 实例 + 白名单**控制可见工具；
   若需彻底不连，需每 agent 各建一套（连接数乘 agent 数）。
 - agent 间协同（形态 C 不含）：若需「协调者自动分派」，可评估上游 `team` 包。
+
+---
+
+## 7. 真实多 agent 同群：暴露的三个缺陷与修复
+
+2026-10-02 的真实运行（两个 agent 在同一飞书群）暴露了三个问题。
+以下是日志证据与修复。
+
+### 7.1 门禁的 bot open_id 是全局单值（阻塞性）
+
+**现象**：`@Infraverse助理`（第二个 bot）无响应。
+
+```
+[pipeline] server: 分流 message_id=om_xxx app_id=cli_aa0110cf25f41be2 agent=root
+[pipeline] server: gate rejected message_id=om_yyy reason=not_mentioned
+```
+
+**为什么这行日志是决定性证据**：门禁在 `pipeline.Handle` 的**第 1 步**
+（`internal/server/pipeline.go:315`），拒绝即返回，走不到后面的路由与分流。
+所以出现 `gate rejected` 说明门禁确实收到了消息，只是用了错误的 open_id
+比对——`TAIJI_FEISHU_BOT_OPEN_ID` 是**单个全局值**，而每个 bot 的 open_id 不同。
+
+**"not_mentioned" 是一个误导性的诊断**：用户明明 @ 了，日志却说「未提及」。
+两个 bot 同时在线时，这个名字会把排查引向「用户没 @」而不是「配置错了」。
+
+**修复**（`internal/channel/gate.go`）：
+
+- `GateInput` 新增 `AppID`（接收该消息的应用）与 `BotOpenIDs`（AppID → open_id 映射）
+- `resolveBotOpenID()` 统一解析：
+  - 映射非 nil → 按 `AppID` 查表；**未命中或空值即 fail-closed**
+    （不回落全局值——否则未注册的 bot 能借用别人的身份通过门禁）
+  - 映射为 nil → 用全局 `BotOpenID`（单 agent 部署行为不变）
+- **不改门禁在 `Handle` 中的位置**：`AppID` 取自消息自身，不依赖分流结果，
+  故「门禁先于一切」的安全语义（`gate.go:72`「顺序即语义」）保持不变
+
+### 7.2 open_id 由启动时自动获取，不需要手填
+
+**为什么不让人手填**：open_id 是**应用维度**的，多 agent 下有几个 bot 就有几个值。
+手填既易错（复制粘贴串号），又在换应用时要求同步改配置——而启动时本来就要
+用凭据换 token，顺带取一次的成本近乎零。
+
+**实现**（`internal/channel/feishu/botinfo.go`）：
+
+- 调 `/open-apis/bot/v3/info`（该端点未被 SDK 生成，走 `client.Get` 原生请求）
+- 启动时按各 agent 凭据逐个获取，构造 `AppID → open_id` 映射
+- **失败即中止启动**并点名是哪个 agent——取不到 open_id 的 bot 会被门禁
+  fail-closed 拒掉所有群消息（表现为「bot 活着但永远不响应」），
+  静默继续比启动失败难排查得多
+
+### 7.3 启动日志明文打印 app_secret（凭据泄露）
+
+**现象**：启动日志第一段直接打出完整凭据。
+
+```
+生效的控制值（来自受信启动环境）:
+  TAIJI_AGENTS=name=root,app_id=cli_xxx,app_secret=xcnabOIOaSY5...（明文）
+```
+
+**根因**（`cmd/taiji/main.go` 的 `printControlValues`）：原样打印所有控制值。
+而 `TAIJI_AGENTS` 是保留键（`internal/config/guard.go:32`），其值内嵌每个
+agent 的 `app_secret`。
+
+**为什么是脱敏而不是不打印**：打印控制值是 #1 的 demo path 证据面
+（证明工作区文件覆盖不了保留键），且 `name`/`app_id`/`parent` 正是排障最需要的。
+
+**修复**（`cmd/taiji/redact.go`），两层：
+
+1. **键名级**：复用 `config.IsCredentialKey`（权威声明）+ 词表兜底。
+   这层覆盖 `TAIJI_MCP_HEADERS_*` —— 键名不含敏感词，但由
+   `ReservedPrefixes` 声明为凭据。
+2. **字段级**：值内部含敏感字段（`app_secret=xxx`）或 URL userinfo
+   （`https://user:pw@host`）→ 只脱敏该部分。
+   `TAIJI_AGENTS` 的键名不含敏感词，只做第 1 层会漏掉它。
+
+**URL 特例**：保留 scheme 与 host（排障要看连的是哪台机器），
+只抹 userinfo——整条变 `***` 会让 base URL 配错时无法从日志发现。
+
+### 7.4 多 agent 部署不再要求全局飞书凭据
+
+**现象**：`TAIJI_AGENTS` 里每个 agent 都有凭据，却报
+`feishu: outbound requires FEISHU_APP_ID and FEISHU_APP_SECRET`。
+
+**根因**：`buildPipeline` 无条件构造全局 sender，而多 agent 的真正出站在
+`buildAgents` 里按 agent 各建一个——这个全局 sender **不会被用到**，
+但它在前面先失败了。
+
+**修复**：多 agent 时用**第一个 agent 的凭据**构造它。语义自洽
+（不是凭空要求用户再配一套用不上的全局凭据），且 `server.New` 的
+非 nil 校验仍然满足。
+
+### 7.5 验证
+
+| 项 | 证据 |
+|---|---|
+| 门禁 per-agent | 6 个新测试全绿；**反证**改回全局单值 → `reason="not_mentioned"`，与生产日志逐字一致 |
+| open_id 自动获取 | 6 个测试（真实 SDK + httptest 假端点，走通 token 换取与响应解析） |
+| 脱敏 | 6 个测试（含走完整打印链的 `printControlValuesTo`）；**反证**改回原样打印 → 明文泄露被抓 |
+| 全量 | `go test ./... -count=1` → 11 包 ok / 0 FAIL |
+| 端到端 | 启动日志显示 `app_secret=***` 且保留 name/app_id；多 agent 无全局凭据可推进到连接阶段 |
+
+### 7.6 上一轮判断的修正
+
+我曾把「多个 bot 共用全局 Deduper 会误伤消息」列为**严重**问题。
+本次真实日志**不支持**该判断：
+
+- 两条消息各有独立的 `message_id`（`om_x100b64dbd55a84a4` / `om_x100b64dbd155a4a4`）
+- 日志中**没有**任何 `duplicate message ignored`
+
+**修正**：飞书给每个 bot 的投递有独立 message_id，用去重键误伤不成立。
+门禁才是唯一阻塞点。
+（**保留错误记录**：这是「需实测定性」的推测被实测推翻，不是当初就该知道的事。）

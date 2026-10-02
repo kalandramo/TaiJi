@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/kalandramo/TaiJi/internal/agentreg"
 	"github.com/kalandramo/TaiJi/internal/authz"
@@ -360,20 +361,29 @@ func runServe(args []string) int {
 
 // printControlValues 打印保留键的最终生效值。
 // 这是 #1 demo path 的证据面：无论工作区写了什么，这里显示的都必须来自启动环境。
+//
+// 输出经 redactControlValue 脱敏——控制值里含凭据（TAIJI_AGENTS 嵌
+// app_secret，TAIJI_MODEL_API_KEY 等键名即敏感），而这段会进 CI 归档、
+// 也会被用户贴出来排障。
 func printControlValues(cfg map[string]string) {
+	printControlValuesTo(os.Stderr, cfg)
+}
+
+// printControlValuesTo 是可测版本（注入 writer，验证真实打印链的脱敏）。
+func printControlValuesTo(w io.Writer, cfg map[string]string) {
 	keys := make([]string, 0, len(config.ReservedKeys))
 	for k := range config.ReservedKeys {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	fmt.Fprintln(os.Stderr, "生效的控制值（来自受信启动环境）:")
+	fmt.Fprintln(w, "生效的控制值（来自受信启动环境）:")
 	for _, k := range keys {
 		v, ok := cfg[k]
 		if !ok {
 			continue
 		}
-		fmt.Fprintf(os.Stderr, "  %s=%s\n", k, v)
+		fmt.Fprintf(w, "  %s=%s\n", k, redactControlValue(k, v))
 	}
 }
 
@@ -519,7 +529,20 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 
 	// 出站：需要应用凭据换 tenant_access_token。
 	// 放在权限校验之后——校验是纯配置检查，先暴露配置错误更省事。
-	sender, err := feishu.NewSender(feishu.SenderConfigFromEnv(loaded))
+	//
+	// 多 agent 部署下的语义：真正的出站在 buildAgents 里按 agent 各建一个
+	// （凭据隔离），这个全局 sender **不会被用到**（server 按 agent 查
+	// Senders map）。但它不能为 nil——server.New 硬性要求非 nil。
+	// 故用**第一个 agent 的凭据**构造它：语义自洽（不是凭空要求用户
+	// 再配一套用不上的全局凭据），且失败时错误指向具体的 agent。
+	senderCfg := feishu.SenderConfigFromEnv(loaded)
+	if len(agentSpecs) > 1 {
+		senderCfg = feishu.SenderConfig{
+			AppID:     agentSpecs[0].AppID,
+			AppSecret: agentSpecs[0].AppSecret,
+		}
+	}
+	sender, err := feishu.NewSender(senderCfg)
 	if err != nil {
 		bootstrap.CloseMCPSets(toolSets)
 		return nil, err
@@ -600,6 +623,31 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	// cmd.Deps（/stop 的 Handler 用）与 server.Config（管道执行 run 时用）。
 	// 两者必须是**同一实例**——否则 /stop 取消的是另一个注册表里的 run。
 	gateCfg := gateConfigFromEnv()
+
+	// 多 agent 部署：按各 agent 的凭据取 bot open_id，构造 AppID → open_id 映射。
+	//
+	// 为什么必须按 agent 取：每个 bot 的 open_id 不同，门禁要拿**接收该消息
+	// 的那个 bot** 的 open_id 去比对 mentions。用全局单值会让「@ bot B」被判成
+	// not_mentioned（2026-10-02 真实双 agent 同群故障）。
+	//
+	// 为什么自动取而非让人手填：open_id 是应用维度的，手填既易错（复制粘贴
+	// 串号）又在换应用时要求同步改配置。凭据已在手，open_id 是它的函数。
+	//
+	// 失败即中止：取不到 open_id 的 bot 会被门禁 fail-closed 拒绝所有群消息
+	// （表现为「bot 活着但永远不响应」），静默继续比启动失败更难排查。
+	if len(agentSpecs) > 1 {
+		botCtx, cancelBot := ctxForBotInfo()
+		mapping, err := fetchBotOpenIDs(botCtx, agentSpecs)
+		cancelBot()
+		if err != nil {
+			executor.Close()
+			bootstrap.CloseMCPSets(toolSets)
+			return nil, err
+		}
+		gateCfg.BotOpenIDs = mapping
+		logf("门禁：已按 agent 取 bot open_id（%d 个）", len(mapping))
+	}
+
 	wsID := workspaceID(loaded)
 	cancels := server.NewCancelRegistry()
 	sessionGens := newSessionGenerations()
@@ -706,6 +754,45 @@ func gateConfigFromEnv() server.GateConfig {
 		BotOpenID: strings.TrimSpace(os.Getenv("TAIJI_FEISHU_BOT_OPEN_ID")),
 		Owners:    owners,
 	}
+}
+
+// ctxForBotInfo 给启动期的 bot info 调用一个带超时的 ctx。
+//
+// 返回 cancel 由调用方 defer——丢弃它会泄漏 ctx（go vet 会报
+// "the cancel function returned by context.WithTimeout should be called"）。
+//
+// 启动期一次性调用，无外部取消源；超时防止网络问题让启动永久挂住
+// （用户会以为服务卡死，而实际只是在等一个 HTTP 响应）。
+func ctxForBotInfo() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), botInfoTimeout)
+}
+
+// botInfoTimeout 是单个 bot info 请求的时限。
+const botInfoTimeout = 15 * time.Second
+
+// fetchBotOpenIDs 按各 agent 的凭据取 bot open_id，返回 AppID → open_id 映射。
+//
+// 用于门禁的 per-agent @ 判定（每个 bot 的 open_id 不同）。
+//
+// 失败即返回 error（fail-fast）：某个 agent 取不到 open_id，它的群消息
+// 会被门禁 fail-closed 全拒——表面是「bot 在线但不理人」，用户无从判断
+// 是权限、门禁还是网络问题。启动即报错比这好得多，且错误里点名是哪个 agent。
+//
+// 串行调用而非并发：agent 数是个位数、各一次 HTTP、启动期只跑一次，
+// 并发的复杂度换不来可感知的收益。
+func fetchBotOpenIDs(ctx context.Context, specs []agentSpec) (map[string]string, error) {
+	out := make(map[string]string, len(specs))
+	for _, spec := range specs {
+		openID, err := feishu.FetchBotOpenID(ctx, spec.AppID, spec.AppSecret)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"获取 agent %q 的 bot open_id 失败（app_id=%s）：%w\n"+
+					"提示：该 open_id 用于群聊 @ 判定，取不到则此 bot 的群消息会被拒绝",
+				spec.Name, spec.AppID, err)
+		}
+		out[spec.AppID] = openID
+	}
+	return out, nil
 }
 
 // workspaceID 返回串行化域与路由用的 workspace 标识。

@@ -65,6 +65,23 @@ var ReservedPrefixes = []string{
 	"TAIJI_MCP_HEADERS_",
 }
 
+// IsCredentialKey 判断键是否为凭据（含前缀保护的族）。
+//
+// 供日志脱敏等场景复用——「哪些键是凭据」的知识必须只有一处
+// （本文件），否则新增凭据键时脱敏侧会与保护侧漂移，
+// 表现为「工作区改不了，却在日志里明文打印」。
+func IsCredentialKey(key string) bool {
+	if _, ok := CredentialKeys[key]; ok {
+		return true
+	}
+	for _, p := range ReservedPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // isReserved 判断键是否受保护（工作区不可提供）。
 func isReserved(key string) bool {
 	if _, ok := ReservedKeys[key]; ok {
