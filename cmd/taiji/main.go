@@ -51,7 +51,7 @@ const usage = `taiji — Go 原生 Agent Harness（原型）
 
 命令:
   chat     交互式对话
-  serve    启动渠道服务（飞书 webhook / 长连接）
+  serve    启动渠道服务（飞书长连接，只需出网）
 
 全局 flags:
   --config <path>   工作区环境文件（不能覆盖保留键，见设计文档 §4.6）
