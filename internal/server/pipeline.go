@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kalandramo/TaiJi/internal/agentreg"
@@ -387,7 +388,16 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 	// 未命中注册表时**返回 false 而非报错**——走正常消息路径。
 	// 这保证 `/usr/local/bin 是什么` 这类文本不被误伤（FR-C1）。
 	if p.commands != nil {
-		if res := p.commands.Parse(msg.Content); res.OK {
+		// 群聊里 @bot 在正文中是**占位符**（飞书为 `@_user_1`），故实际
+		// 正文形如 `@_user_1 /whoami`——直接 Parse 会失败（Parse 要求
+		// 以 "/" 开头，SPEC §4.2），退化到普通消息路径，模型看到
+		// `@_user_1 /whoami` 并把它当问题回答（真实故障：模型回
+		// 「你是 _user_1」）。
+		//
+		// 这里剥掉**前导** mention 占位符再交给 Parse。
+		// 为什么只用于解析、不写回 msg.Content：模型该看到原始文本
+		// （含 @ 上下文）；改写正文会影响下游所有消费方。
+		if res := p.commands.Parse(stripLeadingMentions(msg.Content, msg.Mentions)); res.OK {
 			return p.handleCommand(ctx, msg, target, res)
 		}
 	}
@@ -507,6 +517,48 @@ func (p *Pipeline) scopedSessionID(base string) string {
 		return base
 	}
 	return base + "#gen:" + strconv.Itoa(gen)
+}
+
+// stripLeadingMentions 剥掉正文**开头连续的** @ 占位符及其后空白。
+//
+// 用途：把群聊正文归一化成「命令解析能识别的形态」——
+// 飞书群消息的正文里 @机器人 是占位符（`@_user_1`），故
+// `@道客服务助手 /whoami` 的实际正文是 `@_user_1 /whoami`。
+//
+// **用 Mentions 元数据的 Key 精确匹配，不做文本猜测**：
+// 不猜「@xxx 」这种形态（用户名可含空格、可能被用户手写模拟）。
+// Key 是平台给的占位符字面量，比对它是确定的。
+//
+// **只剥开头的**：正文中间的 `@_user_1` 是用户内容的一部分
+// （如「你好 @_user_1」），剥掉会篡改用户输入。
+//
+// Key 为空的 mention 被忽略（跳过而非中止）——它无法参与匹配，
+// 但不该因此让整条消息失去被识别的机会。
+func stripLeadingMentions(content string, mentions []channel.Mention) string {
+	s := content
+	for {
+		trimmed := strings.TrimLeft(s, " \t")
+		matched := false
+		for _, m := range mentions {
+			if m.Key == "" {
+				continue
+			}
+			// HasPrefix + 后一个字符是空白或结束，避免把 `@_user_1x`
+			// 误当成 `@_user_1`（防前缀误匹配）。
+			if !strings.HasPrefix(trimmed, m.Key) {
+				continue
+			}
+			rest := trimmed[len(m.Key):]
+			if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
+				s = rest
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return strings.TrimSpace(s)
+		}
+	}
 }
 
 // handleCommand 处理一条命令（SPEC §5.1）。

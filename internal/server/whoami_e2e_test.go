@@ -190,3 +190,43 @@ func TestE2E_NoPermissionDoesNotBypassOwnerOnly(t *testing.T) {
 		t.Error("/whoami 不应限 owner——无权用户更需要自查身份")
 	}
 }
+
+// 群聊场景的端到端（**这正是真实故障的形态**）。
+//
+// 之前的 e2e 测试用了 Content:"/whoami"（私聊形态）——所以全绿，
+// 但真实场景是群聊，正文含 @ 占位符，命令根本没被识别。
+// 这条测试锁住那个盲区。
+func TestE2E_WhoamiInGroupWithMentionPrefix(t *testing.T) {
+	h, sender, exec := newWhoamiHarness(t)
+
+	// 群聊：@bot 后跟命令 → 正文为 "@_user_1 /whoami"（飞书形态）。
+	h.send(t, &channel.IncomingMessage{
+		Platform:       channel.PlatformFeishu,
+		UserID:         "ou_open",
+		UnionID:        "on_group_union",
+		IdentitySource: channel.IdentitySourceUnionID,
+		ChatID:         "oc_group",
+		ChatType:       channel.ChatGroup,
+		MessageID:      "om_group_whoami",
+		Content:        "@_user_1 /whoami",
+		Mentions:       []channel.Mention{{OpenID: "ou_bot", Key: "@_user_1", Name: "TaiJi"}},
+	})
+
+	if !h.waitCalls(t, 1, 2*time.Second) {
+		t.Fatal("群聊发 @bot /whoami 应有回复")
+	}
+	got := sender.snapshot()[0].Text
+
+	// ① 命令必须被识别（而非落到模型）。
+	if !strings.Contains(got, "ws1:feishu:on_group_union") {
+		t.Errorf("群聊 @bot /whoami 应被识别为命令并返回身份，实际:\n%s", got)
+	}
+	// ② 模型不得被调用——若被调用说明正文仍被当普通消息。
+	if inputs := exec.inputs(); len(inputs) != 0 {
+		t.Errorf("命令不应调用模型，executor 却被调用: %v", inputs)
+	}
+	// ③ 回复里不得出现 mention 占位符（那是解析残留的痕迹）。
+	if strings.Contains(got, "_user_1") {
+		t.Errorf("回复不应含 mention 占位符:\n%s", got)
+	}
+}
