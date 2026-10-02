@@ -192,15 +192,34 @@ func incomingFromLongConnEvent(ev *larkim.P2MessageReceiveV1) *channel.IncomingM
 	}
 	m := ev.Event.Message
 
-	// 主体 ID：只认 open_id（与 parse.go 的 extractOpenID 同规则）。
-	var openID string
-	if ev.Event.Sender != nil && ev.Event.Sender.SenderId != nil && ev.Event.Sender.SenderId.OpenId != nil {
-		openID = *ev.Event.Sender.SenderId.OpenId
+	// 主体 ID：open_id（出站投递用）与 union_id（身份键用）。
+	//
+	// ⚠ 两者语义不同，**不可互相替代**：
+	//   - open_id 是应用维度的（同一人在不同应用下不同），只能用于
+	//     出站投递（发消息 API 只认它）
+	//   - union_id 跨应用稳定，用于权限/owner 判定（IdentityID）
+	//
+	// 2026-10-02 实测：同一用户在两个应用下 open_id 不同、union_id 相同。
+	var openID, unionID string
+	if ev.Event.Sender != nil && ev.Event.Sender.SenderId != nil {
+		sid := ev.Event.Sender.SenderId
+		if sid.OpenId != nil {
+			openID = *sid.OpenId
+		}
+		if sid.UnionId != nil {
+			unionID = *sid.UnionId
+		}
 	}
-	if openID == "" {
-		// 无主体 ID 的消息无法参与权限判定——丢弃而非产出残缺消息。
+	if openID == "" && unionID == "" {
+		// 两个身份字段都空——无法参与权限判定，丢弃而非产出残缺消息。
 		// 与 parse.go 的 fail-closed 取向一致。
 		return nil
+	}
+	// 身份键来源：union_id 优先（跨应用稳定）；缺失时回退 open_id。
+	// 回退的代价（身份键不跨应用）由调用方经 IdentitySource 感知。
+	identitySource := channel.IdentitySourceUnionID
+	if unionID == "" {
+		identitySource = channel.IdentitySourceOpenID
 	}
 
 	// 接收方应用 ID：多 bot 分流的依据（形态 C）。
@@ -244,14 +263,16 @@ func incomingFromLongConnEvent(ev *larkim.P2MessageReceiveV1) *channel.IncomingM
 	mentions := extractLongConnMentions(m)
 
 	return &channel.IncomingMessage{
-		Platform:  channel.PlatformFeishu,
-		AppID:     appID,
-		UserID:    openID,
-		ChatID:    chatID,
-		ChatType:  normalizeChatType(chatType),
-		MessageID: messageID,
-		Content:   text,
-		Mentions:  mentions,
+		Platform:       channel.PlatformFeishu,
+		AppID:          appID,
+		UserID:         openID,
+		UnionID:        unionID,
+		IdentitySource: identitySource,
+		ChatID:         chatID,
+		ChatType:       normalizeChatType(chatType),
+		MessageID:      messageID,
+		Content:        text,
+		Mentions:       mentions,
 		Meta: &channel.ChannelMessageMeta{
 			Provider:          string(channel.PlatformFeishu),
 			ChatType:          chatType,

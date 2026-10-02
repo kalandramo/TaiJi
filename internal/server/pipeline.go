@@ -335,9 +335,11 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 		AppID:      msg.AppID,
 		BotOpenID:  p.gate.BotOpenID,
 		BotOpenIDs: p.gate.BotOpenIDs,
-		SenderID:   msg.UserID,
-		Mentions:   msg.Mentions,
-		Owners:     p.gate.Owners,
+		// 身份键（非 open_id）：owner 判定需跨应用稳定，
+		// 否则多 bot 部署下同一用户在一个应用是 owner、另一个不是。
+		SenderID: msg.IdentityID(),
+		Mentions: msg.Mentions,
+		Owners:   p.gate.Owners,
 	})
 	if !decision.Allow {
 		// 静默丢弃：只记日志，不回复。用户不应感知到被拦。
@@ -428,9 +430,14 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 
 	// 身份注入：把发送者身份放进 runCtx，供下游按用户判定。
 	//
-	// 为什么在这里：msg.UserID 来自平台元数据（飞书 sender.open_id，
-	// 见 feishu/parse.go 的 extractOpenID），是**不可伪造**的身份源——
+	// 为什么在这里：msg.IdentityID() 来自平台元数据（飞书 union_id，
+	// 见 feishu/longconn.go），是**不可伪造**的身份源——
 	// 不由调用方参数决定。门禁已用它做 owner 判定，此处让执行层也能读到。
+	//
+	// ⚠ **用 IdentityID() 而非 UserID**：UserID 是 open_id，而它是
+	// **应用维度**的（多 bot 部署下同一用户在不同应用下值不同），
+	// 直接用它会让 RBAC 在每个应用下都要重复绑定（2026-10-02 实测故障）。
+	// IdentityID() 优先返回跨应用稳定的 union_id。
 	//
 	// 框架会把该 ctx 透传到工具回调（beforeTool），故工具策略可据此
 	// 按用户判定。实测验证见 internal/server/principal_e2e_test.go。
@@ -440,7 +447,7 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 	runCtx = authz.WithPrincipal(runCtx, authz.ResolvePrincipal(authz.PrincipalInput{
 		ChannelID: p.route.WorkspaceID,
 		Platform:  string(msg.Platform),
-		OpenID:    msg.UserID,
+		OpenID:    msg.IdentityID(),
 	}))
 	if _, ok := authz.PrincipalFrom(runCtx); !ok {
 		// 身份缺失不阻断执行（向后兼容：CLI 等无渠道身份的场景），
@@ -535,7 +542,9 @@ func (p *Pipeline) handleCommand(
 	principal := authz.ResolvePrincipal(authz.PrincipalInput{
 		ChannelID: p.route.WorkspaceID,
 		Platform:  string(msg.Platform),
-		OpenID:    msg.UserID,
+		// 身份键（非 open_id）：命令权限判定与工具判定必须同源，
+		// 否则会出现「工具能用但命令不能用」这类不一致。
+		OpenID: msg.IdentityID(),
 	})
 	if allowed, err := p.commandAllowed(ctx, principal, res.Name); err != nil {
 		// 「查不了」≠「不允许」——两者都拒，但文案与日志区分
@@ -552,7 +561,9 @@ func (p *Pipeline) handleCommand(
 	}
 
 	// ── ③ OwnerOnly 判定 ──
-	if cmdDef.OwnerOnly && !p.isOwner(msg.UserID) {
+	// 用身份键（非 open_id）：owner 列表也应按跨应用稳定的 ID 配置，
+	// 否则同一用户在一个 bot 下是 owner、另一个不是。
+	if cmdDef.OwnerOnly && !p.isOwner(msg.IdentityID()) {
 		// 日志用脱敏后的 principal（复用已有的 Redacted，不打印裸 open_id）。
 		p.logf("server: command owner-only denied name=%s principal=%s message_id=%s",
 			res.Name, principal.Redacted(), msg.MessageID)
@@ -567,6 +578,11 @@ func (p *Pipeline) handleCommand(
 		SessionGen:   p.sessionGenOf(target.EffectiveJID),
 		QueuePending: p.pendingCount(),
 		WorkspaceID:  p.route.WorkspaceID,
+		// /whoami 需要的身份信息（与判定用的值同源，见 whoamiText）。
+		PrincipalID:    principal.ID,
+		IdentitySource: string(msg.IdentitySource),
+		OpenID:         msg.UserID,
+		Agent:          authz.AgentFrom(ctx),
 	})
 	if err != nil {
 		p.logf("server: command handler failed name=%s message_id=%s err=%v",

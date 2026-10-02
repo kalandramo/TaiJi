@@ -253,3 +253,101 @@ agent 的 `app_secret`。
 **修正**：飞书给每个 bot 的投递有独立 message_id，用去重键误伤不成立。
 门禁才是唯一阻塞点。
 （**保留错误记录**：这是「需实测定性」的推测被实测推翻，不是当初就该知道的事。）
+
+---
+
+## 8. 身份键：open_id 是应用维度的（实测推翻假设）
+
+### 8.1 现象
+
+双 agent 同群，同一用户 @ 两个 bot，被当成**两个人**：
+
+```
+[perm] denied:  not permitted (principal=default:feishu:992b6d40 tool=...)
+[perm] allowed:                principal=default:feishu:a701f26e tool=...
+```
+
+`Principal.Redacted()` 的形态是 `{workspace}:{platform}:{sha256(identity)[:8]}`
+——**摘要不同 ⇒ 身份键不同**。而启动日志显示 `RBAC（2 个角色 / 1 个用户）`：
+只绑了一个用户，所以只有一个 bot 能用。
+
+### 8.2 根因：open_id 是 app-scoped
+
+`docs/01-需求文档.md:946` 早已把这条列为**未实测的假设**：
+
+> 飞书 `open_id` 的**稳定性**——跨应用/跨版本是否一致，未实测；
+> 这直接影响能否直接用它当主体 ID。
+
+本次实测把它测了。探针输出（两个 bot 各收一条同用户消息）：
+
+```
+app_id=cli_aa0110cf25f41be2  open_id=2fab4154  union_id=fbc51fde
+app_id=cli_aa126d218d789d05  open_id=c7b7e562  union_id=fbc51fde  ← 相同
+```
+
+**结论**：open_id 跨应用**不一致**（每个应用各一套）；union_id **一致**。
+
+```
+[perm] denied:  principal=default:feishu:992b6d40   ← bill 应用
+[perm] allowed: principal=default:feishu:a701f26e   ← root 应用
+```
+
+同一个人、两个摘要——这就是 RBAC 只在一个 bot 上生效的原因。
+
+### 8.3 修复：身份键按语义分流
+
+**关键约束：union_id 不能无差别替换 open_id。** 两者用途不同：
+
+| 用途 | 用哪个 | 依据 |
+|---|---|---|
+| 权限 / owner 判定 | **union_id**（`IdentityID()`） | 需跨应用稳定 |
+| 出站投递（私聊） | open_id（`UserID`） | 飞书发消息 API 只认 open_id |
+| 会话隔离键 | open_id | 每 agent 独立 session 是设计要求 |
+
+实现：
+
+- `IncomingMessage` 新增 `UnionID` 与 `IdentitySource`
+- `IdentityID()` 返回 `union_id`，缺失时回退 `open_id`（并标记来源）
+- 三处判定点改用 `IdentityID()`：门禁 owner 判定、`ResolvePrincipal`、
+  命令的 owner 检查
+- **`receiverOf` 保持用 `UserID`**（出站必须 open_id）
+
+**回退而非拒绝**：union_id 的可得性取决于应用的通讯录权限。
+缺它时拒绝消息会让整个 bot 不可用，而回退只是「身份键不跨应用」——
+功能可用，代价由 `IdentitySource` 暴露给用户。
+
+### 8.4 新增 `/whoami` 命令
+
+权限配置要求把主体 ID 写进 `TAIJI_RBAC` / `TAIJI_FEISHU_OWNERS`，
+但该 ID 由平台元数据 + 渠道前缀拼成，**用户无从推导**；
+而日志里是脱敏摘要，不是可配置的原值。没有自查手段时只能盲猜。
+
+```
+> /whoami
+你的身份：
+  主体 ID：default:feishu:fbc51fde
+  配置位置：TAIJI_RBAC 的 user:<上面这串>=<角色名>
+  Agent：bill
+  身份键来源：union_id（跨应用稳定）
+    同一个你在所有 bot 下都是上面这个 ID——配置一次即可。
+  平台 open_id：ou_2fab4154（本应用下）
+```
+
+输出的 ID 与实际判定用的值**同源**（都是 `Principal.ID`），
+避免写出看起来对、实际不匹配的配置。
+
+### 8.5 验证
+
+| 项 | 证据 |
+|---|---|
+| 身份键跨应用一致 | 4 个新测试；**反证**忽略 union_id → `UnionIDIsStableAcrossApps` 变红 |
+| /whoami | 6 个测试（含「无身份不编造」的负向断言） |
+| 全量 | `go test ./... -count=1` → 11 包 ok / 0 FAIL |
+| 实测 | 探针输出（见 8.2），两个 bot 的 union_id 摘要一致 |
+
+### 8.6 迁移提示
+
+`TAIJI_FEISHU_OWNERS` 与 `TAIJI_RBAC` 里的用户键**需要用 union_id 重填**。
+旧的 open_id 值现在不再匹配——但**不会静默失效**：发 `/whoami`
+即可拿到当前生效的 ID。多 agent 部署下，用 open_id 填的配置
+需要在每个应用各写一条（/whoami 会提示这一点）。

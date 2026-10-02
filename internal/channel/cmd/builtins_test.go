@@ -42,11 +42,17 @@ func (s *depsSpy) cancelRun(sessionID string) bool {
 
 // ── 注册完整性 ──
 
-func TestBuiltins_RegistersExactlyFourCommands(t *testing.T) {
+func TestBuiltins_RegistersExpectedCommands(t *testing.T) {
 	r, _ := newBuiltinRegistry(t)
 
 	got := r.SortedNames()
-	want := []string{"clear", "help", "status", "stop"}
+	// v1 的 4 条 + /whoami（2026-10-02 新增，身份自查）。
+	//
+	// 为什么加 /whoami：权限配置要求把主体 ID 写进 TAIJI_RBAC /
+	// TAIJI_FEISHU_OWNERS，但该 ID 由平台元数据 + 渠道前缀拼成，
+	// 用户无从推导；而日志里是脱敏摘要，不是可配置的原值。
+	// 没有自查手段时只能盲猜——真实多 agent 部署已因此卡住。
+	want := []string{"clear", "help", "status", "stop", "whoami"}
 	if len(got) != len(want) {
 		t.Fatalf("注册命令数 = %d, want %d: %v", len(got), len(want), got)
 	}
@@ -55,7 +61,7 @@ func TestBuiltins_RegistersExactlyFourCommands(t *testing.T) {
 			t.Errorf("SortedNames()[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
-	t.Logf("✓ 只注册 4 条 v1 命令: %v", got)
+	t.Logf("✓ 注册命令: %v", got)
 }
 
 // v2 命令不应被注册（SPEC §11.1.1：移出 v1）。
@@ -79,6 +85,9 @@ func TestBuiltins_OwnerOnlyFlags(t *testing.T) {
 		"status": false,
 		"clear":  true,
 		"stop":   true,
+		// /whoami 不限 owner：任何用户都该能查到自己的身份，
+		// 否则无权用户无法自助排查「为什么我没有权限」。
+		"whoami": false,
 	}
 	for name, want := range wantOwnerOnly {
 		c, ok := r.Lookup(name)

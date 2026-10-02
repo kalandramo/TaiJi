@@ -45,13 +45,74 @@ type Mention struct {
 	Name string
 }
 
+// IdentitySource 标明身份键取自哪个平台字段。
+type IdentitySource string
+
+const (
+	// IdentitySourceUnionID 跨应用稳定（首选）。
+	IdentitySourceUnionID IdentitySource = "union_id"
+	// IdentitySourceOpenID 应用维度，**不跨应用**（回退）。
+	IdentitySourceOpenID IdentitySource = "open_id"
+)
+
+// IdentityID 返回**用于权限判定**的身份键。
+//
+// 优先级：union_id > open_id。理由见 IncomingMessage.UnionID 的注释——
+// union_id 跨应用稳定，open_id 每个应用各不相同（多 bot 部署下会导致
+// 同一用户被当成多个人，RBAC 需重复绑定）。
+//
+// 为什么保留 open_id 回退而非直接拒绝：union_id 的可得性取决于应用的
+// 授权范围（不同租户/应用可能不同）。缺它时拒绝消息会让整个 bot 不可用，
+// 而回退到 open_id 只是「身份键不跨应用」——功能可用，代价可接受，
+// 且 IdentitySource 让这个降级**可见**（/whoami 会提示）。
+func (in *IncomingMessage) IdentityID() string {
+	if in == nil {
+		return ""
+	}
+	if in.UnionID != "" {
+		return in.UnionID
+	}
+	return in.UserID
+}
+
 // IncomingMessage 是统一消息。
 //
 // 字段对齐 happyclaw ChannelMessageMeta（happyclaw/src/types.ts:163-176），
 // 见 docs/03-原型设计文档.md:798（§5 接口汇总）与 docs/02-设计文档.md:1035（§5.5.2）。
 type IncomingMessage struct {
-	Platform  Platform
-	UserID    string // 平台原生 ID（飞书为 open_id），取自事件元数据
+	Platform Platform
+
+	// UserID 是平台原生用户 ID（飞书为 **open_id**）。
+	//
+	// ⚠ **open_id 是应用维度（app-scoped）的**——同一用户在不同飞书应用下
+	// 值不同（2026-10-02 实测确认，见 UnionID 的说明）。
+	//
+	// 因此它**不是**合适的身份键，只用于**出站投递**（飞书发消息 API
+	// 只认 open_id）。权限/owner 判定一律用 IdentityID()。
+	UserID string
+	// UnionID 是跨应用稳定的用户 ID（飞书 union_id）。
+	//
+	// 为什么需要它（真实故障）：双 agent 同群运行时，同一用户 @ 两个 bot
+	// 产出两个不同 Principal（因 open_id 不同），而 RBAC 以 Principal.ID
+	// 为键——于是在一个应用下配的权限对另一个无效：
+	//
+	//	[perm] denied:  principal=default:feishu:992b6d40   ← bill 应用
+	//	[perm] allowed: principal=default:feishu:a701f26e   ← root 应用
+	//
+	// 实测（探针输出 2026-10-02 13:39）：
+	//	app_id=cli_aa01...  open_id=2fab4154  union_id=fbc51fde
+	//	app_id=cli_aa12...  open_id=c7b7e562  union_id=fbc51fde  ← 相同
+	//
+	// 这是 docs/01-需求文档.md:946 列出的「未实测假设」被实测**推翻**——
+	// 该条目当时担心 open_id 跨应用不一致，实测确认如此。
+	UnionID string
+	// IdentitySource 记录 IdentityID() 取自哪个字段（union_id / open_id）。
+	//
+	// 用途：union_id 缺失时回退到 open_id 仍可用，但身份键**不再跨应用
+	// 统一**——用户需要知道这一点（否则会困惑于「为什么换个 bot 就没权限」）。
+	// /whoami 据此给出提示。
+	IdentitySource IdentitySource
+
 	ChatID    string // 群 ID（私聊为空）
 	ChatType  ChatType
 	MessageID string // 用于去重

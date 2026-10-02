@@ -29,6 +29,26 @@ type Request struct {
 	QueuePending int
 	// WorkspaceID 是工作区标识（/status 展示，便于排障）。
 	WorkspaceID string
+
+	// ── /whoami 需要（身份自查）──
+
+	// PrincipalID 是权限判定用的完整主体 ID（可直接粘进 RBAC 配置）。
+	//
+	// 形态 {workspace}:{platform}:{identityKey}——与 Principal.ID 一致，
+	// 因为「配置里该写什么」和「判定时用什么」必须是同一个值，
+	// 否则用户会写出看起来对、实际不匹配的配置。
+	PrincipalID string
+	// IdentitySource 标明身份键来自 union_id 还是 open_id（飞书）。
+	//
+	// /whoami 据此提示：用 open_id 时身份键**不跨应用**——
+	// 多 bot 部署下需在每个应用各绑一次。这个信息用户无法自行推断。
+	IdentitySource string
+	// OpenID 是平台原生 ID（飞书 open_id，应用维度）。
+	// 多 agent 部署下需要知道它——排查「这条消息属于哪个应用」时要用。
+	OpenID string
+	// Agent 是本次消息被分流到的 agent 名（多 agent 部署）。
+	// 空串表示单 agent。
+	Agent string
 }
 
 // Deps 是 Handler 需要的外部能力。
@@ -46,11 +66,12 @@ type Deps struct {
 	CancelRun func(sessionID string) bool
 }
 
-// RegisterBuiltins 把 4 条内置命令注册到注册表（SPEC §4.1）。
+// RegisterBuiltins 把内置命令注册到注册表（SPEC §4.1）。
 //
-// **只注册 v1 的 4 条**——/owner_mention 与 /release_owner 移出 v1
-// （需 owner 持久化，见 SPEC §11.1.1）。不注册 = 用户发它们时
-// 走正常消息路径，不会报错也不会误触发。
+// v1 的 4 条（/help /status /clear /stop）加上 /whoami（身份自查）。
+// /owner_mention 与 /release_owner 移出 v1（需 owner 持久化，
+// 见 SPEC §11.1.1）。不注册 = 用户发它们时走正常消息路径，
+// 不会报错也不会误触发。
 func RegisterBuiltins(r *Registry, deps Deps) {
 	r.MustRegister(Command{
 		Name:  "help",
@@ -59,6 +80,15 @@ func RegisterBuiltins(r *Registry, deps Deps) {
 		Handler: func(req Request) (string, error) {
 			// /help 忽略 args（SPEC §5.5）。
 			return r.HelpText(), nil
+		},
+	})
+
+	r.MustRegister(Command{
+		Name:  "whoami",
+		Usage: "/whoami",
+		Desc:  "查看自己的身份（权限配置用）",
+		Handler: func(req Request) (string, error) {
+			return whoamiText(req), nil
 		},
 	})
 
@@ -112,4 +142,51 @@ func RegisterBuiltins(r *Registry, deps Deps) {
 			return "已中断当前生成。", nil
 		},
 	})
+}
+
+// whoamiText 生成身份自查文本（/whoami）。
+//
+// 为什么需要这条命令：权限配置要求把**主体 ID** 写进 TAIJI_RBAC /
+// TAIJI_FEISHU_OWNERS，但用户无从知道那个 ID 是什么——它由平台元数据
+// 加渠道前缀拼成，无法自行推导。没有自查手段时只能读日志猜，
+// 而日志里是**脱敏摘要**（见 Principal.Redacted），不是可配置的原值。
+//
+// 输出的 ID 与实际判定用的值**同源**（都是 Principal.ID），
+// 避免用户写出看起来对、实际不匹配的配置。
+func whoamiText(req Request) string {
+	var sb strings.Builder
+	sb.WriteString("你的身份：\n")
+
+	id := req.PrincipalID
+	if id == "" {
+		// 无身份：不编造。明确说明后果，而不是给一个空行让人困惑。
+		sb.WriteString("  主体 ID：<无法确定——本条消息未携带平台身份>\n")
+		sb.WriteString("  后果：按用户判定的权限（RBAC / owner_only）对你一律不生效。\n")
+		return strings.TrimRight(sb.String(), "\n")
+	}
+	fmt.Fprintf(&sb, "  主体 ID：%s\n", id)
+
+	// 配置位置提示——用户拿到 ID 后要知道写到哪。
+	sb.WriteString("  配置位置：TAIJI_RBAC 的 user:<上面这串>=<角色名>\n")
+
+	if req.Agent != "" {
+		fmt.Fprintf(&sb, "  Agent：%s\n", req.Agent)
+	}
+
+	// 身份键来源：这决定「配置一次是否够用」。
+	switch req.IdentitySource {
+	case "union_id":
+		sb.WriteString("  身份键来源：union_id（跨应用稳定）\n")
+		sb.WriteString("    同一个你在所有 bot 下都是上面这个 ID——配置一次即可。\n")
+	case "open_id":
+		sb.WriteString("  身份键来源：open_id（**应用维度，不跨应用**）\n")
+		sb.WriteString("    ⚠ 同一个你在不同 bot 下 ID 不同——每个 bot 都要单独配一次。\n")
+		sb.WriteString("    取到 union_id 可免除此重复（需应用具备通讯录权限）。\n")
+	}
+
+	// open_id 单独列出：多 agent 部署下排查「哪个应用」时需要它。
+	if req.OpenID != "" {
+		fmt.Fprintf(&sb, "  平台 open_id：%s（本应用下）\n", req.OpenID)
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
