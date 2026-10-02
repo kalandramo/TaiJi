@@ -2,81 +2,18 @@ package feishu
 
 import (
 	"encoding/json"
-	"errors"
 
 	"github.com/kalandramo/TaiJi/internal/channel"
 )
 
-// eventTypeMessage 是飞书「收到消息」事件类型。其余事件一律返回 nil。
-const eventTypeMessage = "im.message.receive_v1"
-
-// callbackEvent 是飞书 2.0 事件体的解析结构。
+// 长连接事件的解析辅助。
 //
-// 只声明本层要用的字段——飞书事件体字段极多，全量建模会让结构随平台演进
-// 持续腐化。未声明字段被 encoding/json 忽略，不影响解析。
+// **历史**：本文件原名为 parse.go，同时承载 webhook 形态的事件解析
+// （ParseCallback 及其配套结构 callbackEvent/eventHeader/eventBody/...）。
+// webhook 形态已移除（只保留长连接），那些结构随之失去消费方，
+// 于 2026-10-02 清理——留着会让读者以为还存在第二条入站路径。
 //
-// 指针用于区分「字段缺失」与「字段为空串」：两者对安全判定意义不同
-// （见 ParseCallback 对 sender 的处理）。
-type callbackEvent struct {
-	Header *eventHeader `json:"header"`
-	Event  *eventBody   `json:"event"`
-}
-
-type eventHeader struct {
-	EventID   string `json:"event_id"`
-	Token     string `json:"token"`
-	EventType string `json:"event_type"`
-}
-
-type eventBody struct {
-	Sender  *eventSender  `json:"sender"`
-	Message *eventMessage `json:"message"`
-}
-
-type eventSender struct {
-	SenderID *senderID `json:"sender_id"`
-}
-
-type senderID struct {
-	// OpenID 是主体的规范身份来源。
-	OpenID string `json:"open_id"`
-	// UserID / UnionID 仅用于日志对照，**不得**作为主体 ID——
-	// 它们是租户内/跨应用 ID，与渠道身份空间不同源。
-	UserID  string `json:"user_id"`
-	UnionID string `json:"union_id"`
-}
-
-type eventMessage struct {
-	MessageID string         `json:"message_id"`
-	ChatID    string         `json:"chat_id"`
-	ChatType  string         `json:"chat_type"`
-	Content   string         `json:"content"`
-	ThreadID  string         `json:"thread_id"`
-	RootID    string         `json:"root_id"`
-	Mentions  []eventMention `json:"mentions"`
-}
-
-type eventMention struct {
-	Key  string     `json:"key"`
-	Name string     `json:"name"`
-	ID   *mentionID `json:"id"`
-}
-
-type mentionID struct {
-	OpenID string `json:"open_id"`
-}
-
-// extractOpenID 从 sender 元数据取主体 ID。
-//
-// 缺失即报错而非降级为空串：空 UserID 会让下游 owner 比对恒不成立
-// （§4.4.5 的 fail-closed 要求——无 owner 信息时拒绝，不放行），
-// 且错误在解析点暴露比在门禁处暴露更容易定位。
-func extractOpenID(sender *eventSender) (string, error) {
-	if sender == nil || sender.SenderID == nil || sender.SenderID.OpenID == "" {
-		return "", errors.New("feishu: message event has no sender open_id")
-	}
-	return sender.SenderID.OpenID, nil
-}
+// 现存的函数均为**长连接路径**所需（调用点集中在 longconn.go）。
 
 // normalizeChatType 把平台值归一化为渠道层的 ChatType。
 //
@@ -99,35 +36,6 @@ func nativeContextType(threadID string) string {
 		return "thread"
 	}
 	return ""
-}
-
-// extractMentions 从元数据取 @ 列表。
-//
-// 必须用元数据而非文本匹配：用户手写 "@TaiJi" 会被 strings.Contains 误判为
-// 「bot 被提及」。门禁比对的是 id.open_id（docs/03-原型设计文档.md:584）。
-//
-// 丢弃 open_id 为空的条目：这种条目无法参与身份比对，
-// 留着只会让门禁的 containsMention 出现「看似命中实则无身份」的假阳性。
-func extractMentions(in []eventMention) []channel.Mention {
-	if len(in) == 0 {
-		return nil
-	}
-
-	out := make([]channel.Mention, 0, len(in))
-	for _, m := range in {
-		if m.ID == nil || m.ID.OpenID == "" {
-			continue
-		}
-		out = append(out, channel.Mention{
-			OpenID: m.ID.OpenID,
-			Key:    m.Key,
-			Name:   m.Name,
-		})
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 // extractText 从 message.content 取出文本。

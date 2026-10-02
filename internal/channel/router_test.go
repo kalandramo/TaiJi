@@ -28,7 +28,7 @@ func TestChannelPrefix_UnknownNonEmptyPlatformKeepsIsolation(t *testing.T) {
 }
 
 func TestChannelPrefix_EmptyPlatformFailsClosed(t *testing.T) {
-	// 空平台是解析层的编程错误（ParseCallback 必定设置 Platform）。
+	// 空平台是解析层的编程错误（解析层必定设置 Platform）。
 	// 返回空串会与「空前缀渠道」撞车；返回固定哨兵值使其在审计中可见且不撞真实渠道。
 	got := ChannelPrefix("")
 	if got == "" {

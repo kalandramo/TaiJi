@@ -70,7 +70,7 @@ const titleMaxRunes = 48
 func ChannelPrefix(p Platform) string {
 	name := string(p)
 	if name == "" {
-		// 空平台是解析层的编程错误（ParseCallback 必设 Platform）。
+		// 空平台是解析层的编程错误（解析层必设 Platform）。
 		// 返回空串会与「无前缀渠道」撞车；返回固定哨兵使其在审计中可见且不撞真实渠道。
 		name = "unknown"
 	}

@@ -52,7 +52,7 @@ func NewDeduper(ttl time.Duration) *Deduper {
 //
 // 空 ID 恒返回 false（不拦）——空 ID 无法作为去重键，把它当作「已见」
 // 会让所有缺 ID 的消息被静默丢弃，那是更糟的失效方向。飞书消息事件
-// 必定带 message_id（parse.go 从元数据取），故实际不会走到这里。
+// 必定带 message_id（event_fields.go 的解析链从元数据取），故实际不会走到这里。
 func (d *Deduper) Seen(messageID string) bool {
 	if messageID == "" {
 		return false

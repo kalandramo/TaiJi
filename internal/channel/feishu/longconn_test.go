@@ -318,7 +318,7 @@ func TestIncomingFromLongConnEvent_ThreadSetsContextType(t *testing.T) {
 
 func TestIncomingFromLongConnEvent_DropsMessagesWithoutSender(t *testing.T) {
 	// 无主体 ID 的消息无法参与权限判定——丢弃而非产出残缺消息
-	// （与 parse.go 的 fail-closed 取向一致）。
+	// （与 event_fields.go 的 fail-closed 取向一致）。
 	str := func(s string) *string { return &s }
 	ev := &larkim.P2MessageReceiveV1{
 		Event: &larkim.P2MessageReceiveV1Data{

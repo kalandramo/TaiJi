@@ -180,12 +180,12 @@ func (l *LongConn) StartErr() error {
 
 // incomingFromLongConnEvent 把 SDK 的长连接事件转成统一消息。
 //
-// 与 parse.go 的 ParseCallback 是**两条入站路径**（长连接 vs webhook），
-// 但产出同一个 channel.IncomingMessage——这是 §4.4.1 分层的目的：
+// 产出 channel.IncomingMessage——这是 §4.4.1 分层的目的：
 // 下游（门禁/路由/执行/出站）不关心消息从哪来。
 //
-// 字段映射与 parse.go 保持一致（主体取 open_id、chat_type 归一化、
-// thread_id 决定话题），避免两条路径的语义漂移。
+// **历史**：曾存在第二条入站路径（webhook 的 ParseCallback），
+// 二者字段映射需保持一致以免语义漂移。webhook 形态已移除，
+// 现在只有本函数一条路径（2026-10-02 清理）。
 func incomingFromLongConnEvent(ev *larkim.P2MessageReceiveV1) *channel.IncomingMessage {
 	if ev == nil || ev.Event == nil || ev.Event.Message == nil {
 		return nil
@@ -212,7 +212,7 @@ func incomingFromLongConnEvent(ev *larkim.P2MessageReceiveV1) *channel.IncomingM
 	}
 	if openID == "" && unionID == "" {
 		// 两个身份字段都空——无法参与权限判定，丢弃而非产出残缺消息。
-		// 与 parse.go 的 fail-closed 取向一致。
+		// 与 event_fields.go 的 fail-closed 取向一致。
 		return nil
 	}
 	// 身份键来源：union_id 优先（跨应用稳定）；缺失时回退 open_id。
@@ -288,8 +288,8 @@ func incomingFromLongConnEvent(ev *larkim.P2MessageReceiveV1) *channel.IncomingM
 
 // extractLongConnMentions 从 SDK 事件取 @ 列表。
 //
-// 与 parse.go 的 extractMentions 同规则：只保留有 open_id 的条目，
-// 丢弃无法参与身份比对的空条目。
+// 只保留有 open_id 的条目——丢弃无法参与身份比对的空条目
+// （否则门禁会看到「看似命中实则无身份」的假阳性）。
 func extractLongConnMentions(m *larkim.EventMessage) []channel.Mention {
 	if m == nil || len(m.Mentions) == 0 {
 		return nil

@@ -26,7 +26,7 @@ const botInfoPath = "/open-apis/bot/v3/info"
 // botInfoResponse 是 /open-apis/bot/v3/info 的响应体。
 //
 // 只声明本层要用的字段——平台该端点的字段多于此处，全量建模会随
-// 平台演进腐化（与 parse.go 的取向一致）。
+// 平台演进腐化（与 event_fields.go 的取向一致）。
 type botInfoResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
