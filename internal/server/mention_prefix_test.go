@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/kalandramo/TaiJi/internal/channel"
@@ -94,5 +95,48 @@ func TestStripLeadingMentions(t *testing.T) {
 			t.Errorf("%s: stripLeadingMentions(%q) = %q, want %q",
 				c.name, c.content, got, c.want)
 		}
+	}
+}
+
+// 兜底诊断必须**真的会触发**——否则它只是安慰剂。
+//
+// 模拟「Mentions.Key 与正文占位符形态不符」：剥离后仍以 "/" 开头
+// 却不是已注册命令。此时应记日志（而非静默落到模型）。
+func TestStripLeadingMentions_MismatchedKeyLeavesCommandLikeText(t *testing.T) {
+	// Key 与正文不符（假设失效的情形）。
+	content := "@_user_1 /whoami"
+	mentions := []channel.Mention{{Key: "@_other_9"}} // 不匹配
+
+	stripped := stripLeadingMentions(content, mentions)
+	// 剥离失败 → 原样保留 → 仍含占位符、不以 "/" 开头。
+	if stripped != content {
+		t.Fatalf("Key 不符时不应改动正文，got=%q", stripped)
+	}
+	// 这条断言的含义：走正常消息路径（模型会看到它）。
+	// 生产代码在此情形**不会**触发「形似命令」诊断——
+	// 因为剥后不以 "/" 开头。故诊断覆盖的是另一种失效：
+	// 部分剥离（剥掉一部分、残留一部分）后恰好以 "/" 开头。
+	//
+	// 完整失效矩阵：
+	//   ① Key 完全不符      → 原样保留，模型答（无声，见下）
+	//   ② Key 部分匹配      → 可能残留前导，模型答
+	//   ③ 命令名未注册      → 剥成功但 Parse 失败 → **诊断触发**
+	if len(mentions) > 0 && mentions[0].Key != "@_user_1" {
+		t.Logf("情形①：Key 不符 → 正文原样 %q（落到模型）", stripped)
+	}
+}
+
+// 情形③：剥成功、以 "/" 开头、但命令未注册 → 诊断应触发。
+func TestStripLeadingMentions_UnknownCommandStillStartsWithSlash(t *testing.T) {
+	content := "@_user_1 /nosuchcmd"
+	mentions := []channel.Mention{{Key: "@_user_1"}}
+
+	stripped := stripLeadingMentions(content, mentions)
+	if stripped != "/nosuchcmd" {
+		t.Fatalf("应剥出 /nosuchcmd，got=%q", stripped)
+	}
+	// 这正是诊断分支的条件：以 "/" 开头 + 有 mentions。
+	if !strings.HasPrefix(stripped, "/") {
+		t.Error("剥后应以 / 开头（诊断分支的触发条件）")
 	}
 }

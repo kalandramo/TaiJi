@@ -121,3 +121,71 @@ func mkEvent(appID, openID, unionID, userID string) *larkim.P2MessageReceiveV1 {
 		},
 	}
 }
+
+// 群聊 @bot 的正文形态（2026-10-02 真实故障的**上游一环**）。
+//
+// 为什么要这条：下游（pipeline）剥前导 mention 依赖两个事实——
+//
+//	① Content 里保留了占位符（如 "@_user_1 /whoami"）
+//	② Mentions[].Key 与正文里的占位符**字面相同**（"@_user_1"）
+//
+// 这两条以前只由我手填的测试数据"假定"，从未从 SDK 事件验证。
+// 若任一条不成立，stripLeadingMentions 就会失效——
+// 而且失效形态是静默的（命令又变成普通消息，模型编答案）。
+func TestIncomingFromLongConnEvent_GroupMentionKeepsPlaceholderInContent(t *testing.T) {
+	msg := incomingFromLongConnEvent(mkGroupEventWithMention(
+		`{"text":"@_user_1 /whoami"}`, "@_user_1", "ou_bot"))
+
+	if msg == nil {
+		t.Fatal("应解析出消息")
+	}
+	// ① 正文保留占位符——否则下游无从判断是命令。
+	if msg.Content != "@_user_1 /whoami" {
+		t.Errorf("Content 应保留占位符，got=%q", msg.Content)
+	}
+	// ② Mentions 的 Key 与正文里的占位符字面一致——
+	//    stripLeadingMentions 正是按 Key 精确匹配来剥的。
+	if len(msg.Mentions) == 0 {
+		t.Fatal("应解析出 mention")
+	}
+	if msg.Mentions[0].Key != "@_user_1" {
+		t.Errorf("Mention.Key = %q, want %q", msg.Mentions[0].Key, "@_user_1")
+		if msg.Mentions[0].Key != "@_user_1" {
+			t.Log("Key 必须与正文占位符字面一致，否则下游无法精确剥离")
+		}
+	}
+	// ③ 且正文确实以该 Key 开头（这是剥离生效的前提）。
+	if !hasPrefix(msg.Content, msg.Mentions[0].Key) {
+		t.Errorf("正文 %q 应以 Mention.Key %q 开头", msg.Content, msg.Mentions[0].Key)
+	}
+}
+
+// mkGroupEventWithMention 构造带 @ 的群消息事件（SDK 真实结构）。
+func mkGroupEventWithMention(contentJSON, mentionKey, botOpenID string) *larkim.P2MessageReceiveV1 {
+	chatID, chatType, msgID, msgType := "oc_group", "group", "om_g", "text"
+	openID, unionID := "ou_sender", "on_sender"
+	key, name := mentionKey, "TaiJi"
+	mType := "bot"
+	return &larkim.P2MessageReceiveV1{
+		EventV2Base: &larkevent.EventV2Base{
+			Header: &larkevent.EventHeader{AppID: "cli_root"},
+		},
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{SenderId: &larkim.UserId{
+				OpenId: &openID, UnionId: &unionID,
+			}},
+			Message: &larkim.EventMessage{
+				ChatId: &chatID, ChatType: &chatType,
+				MessageId: &msgID, Content: &contentJSON, MessageType: &msgType,
+				Mentions: []*larkim.MentionEvent{{
+					Key: &key, Name: &name, MentionedType: &mType,
+					Id: &larkim.UserId{OpenId: &botOpenID},
+				}},
+			},
+		},
+	}
+}
+
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}

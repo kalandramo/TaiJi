@@ -397,8 +397,24 @@ func (p *Pipeline) Handle(ctx context.Context, msg *channel.IncomingMessage) err
 		// 这里剥掉**前导** mention 占位符再交给 Parse。
 		// 为什么只用于解析、不写回 msg.Content：模型该看到原始文本
 		// （含 @ 上下文）；改写正文会影响下游所有消费方。
-		if res := p.commands.Parse(stripLeadingMentions(msg.Content, msg.Mentions)); res.OK {
+		stripped := stripLeadingMentions(msg.Content, msg.Mentions)
+		if res := p.commands.Parse(stripped); res.OK {
 			return p.handleCommand(ctx, msg, target, res)
+		}
+		// 诊断（防静默失效）：正文**剥离后**看起来像命令（以 "/" 开头）、
+		// 却没被识别——说明剥离没做到位（如平台的 Key 形态与正文
+		// 占位符不一致，或命令名未注册）。
+		//
+		// 为什么需要它：这是最容易静默退化的环节——消息会落到模型，
+		// 模型把 "/whoami" 当问题回答，用户只看到一堆胡话。
+		//
+		// 只记日志不改行为——正文确实可能是普通文本（如 `/tmp 在哪`），
+		// 故不能因为「像命令」就报错。有日志则排查有据。
+		if strings.HasPrefix(stripped, "/") && len(msg.Mentions) > 0 {
+			p.logf("server: 剥离 mention 后形似命令但未识别 message_id=%s "+
+				"content=%q mentions=%d（可能是 mention Key 与正文占位符形态不符，"+
+				"或命令名未注册）",
+				msg.MessageID, stripped, len(msg.Mentions))
 		}
 	}
 
