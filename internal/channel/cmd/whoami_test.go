@@ -111,3 +111,23 @@ func TestWhoami_HandlerReturnsText(t *testing.T) {
 		t.Errorf("Handler 输出应含主体 ID: %q", got)
 	}
 }
+
+func TestHelp_MarksNoPermissionCommands(t *testing.T) {
+	// /help 必须标出免权限命令——否则用户会照着列表去配 cmd:whoami，
+	// 而那是多余的（配了也不影响，但不配才对）。
+	r, _ := newBuiltinRegistry(t)
+	help := r.HelpText()
+
+	if !strings.Contains(help, "whoami") {
+		t.Fatalf("/help 应列出 /whoami:\n%s", help)
+	}
+	if !strings.Contains(help, "无需配权限") {
+		t.Errorf("/help 应标注 /whoami 无需配权限:\n%s", help)
+	}
+	// 反向：其它命令不得被误标（那会让用户以为不用配权限）。
+	for _, line := range strings.Split(help, "\n") {
+		if strings.Contains(line, "无需配权限") && !strings.Contains(line, "whoami") {
+			t.Errorf("只有 /whoami 可标「无需配权限」，误标于:\n%s", line)
+		}
+	}
+}

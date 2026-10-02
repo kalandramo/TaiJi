@@ -54,6 +54,22 @@ type Command struct {
 	// owner 是「资源属于谁」，RBAC 是「主体能做什么」。两者都要过。
 	// 本包只**声明**该属性，判定由调用方做（它才知道谁是 owner）。
 	OwnerOnly bool
+	// NoPermission 标记「不需要 RBAC 权限点即可执行」。
+	//
+	// ⚠ **这是一个需要克制的口子**——只有满足以下全部条件的命令才配用它：
+	//
+	//  1. **只回显调用者自己的信息**，不含他人数据（不构成信息泄露）
+	//  2. **不改变任何状态**（不写库、不发外部请求、不影响他人）
+	//  3. 存在**循环依赖**：用户需要这条命令的输出才能配置权限本身
+	//
+	// 第 3 条是关键——没有它，普通命令不该豁免（配权限是用户的事）。
+	// 目前只有 /whoami 满足：它回显本人的主体 ID，而该 ID 正是配置
+	// TAIJI_RBAC 所必需的值。若要求 cmd:whoami 权限，就形成
+	// 「配权限 → 需要 ID → 要权限 → 先配权限」的死锁。
+	//
+	// 与 OwnerOnly 正交：本标记**只跳过 RBAC 检查**，不跳过 OwnerOnly
+	// （若某命令两者都设，owner 判定仍生效）。
+	NoPermission bool
 	// Handler 执行命令。
 	//
 	// 返回的 string 是给用户的回复文本；error 表示执行失败。
@@ -167,6 +183,11 @@ func (r *Registry) HelpText() string {
 		desc := c.Desc
 		if c.OwnerOnly {
 			desc += "（仅 owner）"
+		}
+		// 免权限命令要标注——用户据此知道**不需要**为它配权限点。
+		// 不标注会让人照着 /help 去配 cmd:whoami，而那是多余的。
+		if c.NoPermission {
+			desc += "（无需配权限）"
 		}
 		fmt.Fprintf(&sb, "  %-*s  %s\n", width, usage, desc)
 	}

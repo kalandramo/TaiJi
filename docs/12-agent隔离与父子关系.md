@@ -351,3 +351,46 @@ app_id=cli_aa126d218d789d05  open_id=c7b7e562  union_id=fbc51fde  ← 相同
 旧的 open_id 值现在不再匹配——但**不会静默失效**：发 `/whoami`
 即可拿到当前生效的 ID。多 agent 部署下，用 open_id 填的配置
 需要在每个应用各写一条（/whoami 会提示这一点）。
+
+### 8.7 /whoami 为何免权限（NoPermission 标记）
+
+**循环依赖**：`/whoami` 的输出（主体 ID）正是配置 `TAIJI_RBAC` 所必需的值：
+
+```
+配 RBAC → 需要主体 ID → 用 /whoami 查 → 需要 cmd:whoami 权限 → 先配 RBAC → ...
+```
+
+端到端测试复现了这个死锁（去掉豁免后）：
+
+```
+你没有使用命令 /whoami 的权限。这是确定性拒绝，重试不会成功。
+```
+
+**修复**：`Command` 新增 `NoPermission` 标记，只跳过 RBAC 检查。
+
+**为什么这个口子是安全的**——`NoPermission` 的使用条件是三条全满足
+（写在 `registry.go` 的字段注释里，作为准入纪律）：
+
+1. 只回显调用者**自己**的信息（不含他人数据）
+2. **不改变任何状态**
+3. 存在上述**循环依赖**
+
+第 3 条是关键——没有它，普通命令不该豁免。目前只有 `/whoami` 满足。
+
+**两条正交性约束（已用测试锁住）**：
+
+- 豁免**不跳过** `OwnerOnly`：若某命令两者都设，owner 判定仍生效
+- 豁免**不扩散**：`/status` 等未标记命令仍受 RBAC 约束
+  （反证：`TestE2E_NoPermissionBypassDoesNotLeakToOtherCommands`）
+
+**豁免也留痕**——即使放行也记日志：
+
+```
+server: command permission bypassed name=whoami principal=...（NoPermission）
+```
+
+理由：静默豁免是最危险的失效形态。若哪天有人误加标记，
+日志是唯一能追出「谁在什么时候绕过了权限」的依据。
+
+**/help 会标注**「（无需配权限）」——否则用户会照着列表去配
+`cmd:whoami`，而那是多余的。

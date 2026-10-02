@@ -712,11 +712,14 @@ func buildPipeline(loaded map[string]string, logw io.Writer) (*pipelineHolder, e
 	// 用户看到「已启用」会以为没问题。故提示必须点明「需要 cmd: 权限点」。
 	if permissions == nil {
 		logf("警告：未配用户级权限源，命令将全部被拒（fail-closed）。" +
-			"配 TAIJI_RBAC 并在 role 权限列表里加上 cmd:help、cmd:stop 等即可放行")
+			"配 TAIJI_RBAC 并在 role 权限列表里加上 cmd:help、cmd:stop 等即可放行。" +
+			"例外：/whoami 无需权限，可先用它查出自己的主体 ID（配 RBAC 要用）")
 	} else {
 		logf("命令权限点形如 cmd:help、cmd:status、cmd:clear、cmd:stop——" +
 			"须在 TAIJI_RBAC 的 role 权限列表里**显式**列出；" +
-			"TAIJI_USER_PERMISSIONS（工具权限）不含它们")
+			"TAIJI_USER_PERMISSIONS（工具权限）不含它们。" +
+			"例外：/whoami 无需权限（它用于查你自己的主体 ID，" +
+			"而配 TAIJI_RBAC 正需要该 ID——若也要求权限则形成死锁）")
 	}
 	return &pipelineHolder{Pipeline: p, executor: executor}, nil
 }

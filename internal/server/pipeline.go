@@ -546,7 +546,21 @@ func (p *Pipeline) handleCommand(
 		// 否则会出现「工具能用但命令不能用」这类不一致。
 		OpenID: msg.IdentityID(),
 	})
-	if allowed, err := p.commandAllowed(ctx, principal, res.Name); err != nil {
+	// 免权限命令（Command.NoPermission）：跳过 RBAC 检查。
+	//
+	// 存在的唯一理由是**循环依赖**——用户需要命令的输出才能配置权限
+	// 本身（/whoami 给出主体 ID，而配 TAIJI_RBAC 正需要它）。
+	// 没有这个依赖的命令一律不该豁免。
+	//
+	// 即使豁免也**留痕**：静默豁免是最危险的失效形态——
+	// 若哪天有人误加标记，日志是唯一能追出「谁在什么时候绕过了权限」的依据。
+	//
+	// 注意：本豁免**不跳过** ③ 的 OwnerOnly 判定——两者正交
+	// （registry.go 的 Command 注释），豁免一个不该连带另一个。
+	if cmdDef.NoPermission {
+		p.logf("server: command permission bypassed name=%s principal=%s（NoPermission）",
+			res.Name, principal.Redacted())
+	} else if allowed, err := p.commandAllowed(ctx, principal, res.Name); err != nil {
 		// 「查不了」≠「不允许」——两者都拒，但文案与日志区分
 		// （复用 permission_plugin.go 的既有语义）。
 		p.logf("server: command permission check failed name=%s principal=%s err=%v",

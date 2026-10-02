@@ -87,6 +87,9 @@ func RegisterBuiltins(r *Registry, deps Deps) {
 		Name:  "whoami",
 		Usage: "/whoami",
 		Desc:  "查看自己的身份（权限配置用）",
+		// NoPermission：解开「配权限需要 ID、查 ID 需要权限」的死锁。
+		// 只回显调用者本人的主体 ID，不含他人数据、不改状态。
+		NoPermission: true,
 		Handler: func(req Request) (string, error) {
 			return whoamiText(req), nil
 		},
