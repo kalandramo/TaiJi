@@ -38,7 +38,13 @@ type Options struct {
 	// 名字必须是「模型可见名」——MCP 工具要写 srvA_echo 而非 echo。
 	// 装配期会校验名字是否已注册，未注册即报错（AC-4）。
 	//
-	// 这是**部署级**策略：哪些工具在本部署启用。
+	// **范围取决于装配方**（2026-10-02 修正，原注释写「部署级」不准确）：
+	//   - 单 agent：部署级——全局一份
+	//   - 多 agent：可由 `TAIJI_AGENTS` 的 `allow_tools=` 按 agent 覆盖
+	//     （见 cmd/taiji 的 buildOne：spec 非空则用它，否则回退全局）
+	//
+	// 每 agent 各建一个策略插件（newToolPolicy 用该 agent 自己的 Tools()），
+	// 故 per-agent 白名单是真实生效的，不只是配置面写法。
 	AllowTools []string
 	// Permissions 是**用户级**权限源（方案 A：静态配置）。
 	//
