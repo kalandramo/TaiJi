@@ -603,7 +603,29 @@ func (p *Pipeline) handleCommand(
 
 	receiver, idType := receiverOf(msg)
 
-	// ── ② 命令权限判定 ──
+	// 命令回复也必须用**该消息所属 agent** 的凭据发出（凭据隔离）。
+	//
+	// 与正常消息路径同源：用 resolveAgent(msg) 按 AppID 解析 agent，
+	// 再经 senderFor 选凭据。不这么做则所有命令回复都显示同一个 bot
+	// 的身份（2026-10-02 实测故障）。
+	//
+	// 解析失败不阻断命令执行——按「未启用多 agent」处理（agent 空串
+	// → senderFor 回退全局 sender）。理由：命令多为自省/控制类，
+	// 因分流问题静默不响应比用错身份发出更糟；且正常消息路径
+	// 已在更早处对未知 AppID fail-closed，此处不会成为绕过点。
+	agent, agentErr := p.resolveAgent(msg)
+	if agentErr != nil {
+		p.logf("server: 命令回复的分流解析失败 message_id=%s app_id=%s err=%v"+
+			"（回退全局凭据）", msg.MessageID, msg.AppID, agentErr)
+		agent = ""
+	}
+	replySender, err := p.senderFor(agent)
+	if err != nil {
+		// 装配缺失（agent 无对应 sender）——这是配置错误，必须可见。
+		p.logf("server: 命令回复取 sender 失败 name=%s agent=%s err=%v",
+			res.Name, agent, err)
+		return nil
+	}
 	//
 	// 为什么显式判定而非依赖 beforeTool 插件：命令不经过工具链，
 	// 插件只在工具调用时触发（SPEC §2.2 裂缝 2）。
@@ -633,12 +655,12 @@ func (p *Pipeline) handleCommand(
 		// （复用 permission_plugin.go 的既有语义）。
 		p.logf("server: command permission check failed name=%s principal=%s err=%v",
 			res.Name, principal.Redacted(), err)
-		return p.replyCommand(ctx, receiver, idType,
+		return p.replyCommand(ctx, replySender, receiver, idType,
 			"权限校验暂时不可用，请稍后重试。")
 	} else if !allowed {
 		p.logf("server: command denied name=%s principal=%s（cmd:%s）",
 			res.Name, principal.Redacted(), res.Name)
-		return p.replyCommand(ctx, receiver, idType,
+		return p.replyCommand(ctx, replySender, receiver, idType,
 			fmt.Sprintf("你没有使用命令 /%s 的权限。这是确定性拒绝，重试不会成功。", res.Name))
 	}
 
@@ -649,7 +671,7 @@ func (p *Pipeline) handleCommand(
 		// 日志用脱敏后的 principal（复用已有的 Redacted，不打印裸 open_id）。
 		p.logf("server: command owner-only denied name=%s principal=%s message_id=%s",
 			res.Name, principal.Redacted(), msg.MessageID)
-		return p.replyCommand(ctx, receiver, idType,
+		return p.replyCommand(ctx, replySender, receiver, idType,
 			"只有工作区 owner 才能执行此命令。")
 	}
 
@@ -669,13 +691,13 @@ func (p *Pipeline) handleCommand(
 	if err != nil {
 		p.logf("server: command handler failed name=%s message_id=%s err=%v",
 			res.Name, msg.MessageID, err)
-		return p.replyCommand(ctx, receiver, idType,
+		return p.replyCommand(ctx, replySender, receiver, idType,
 			fmt.Sprintf("命令执行失败：%v", err))
 	}
 
 	p.logf("server: command executed name=%s principal=%s message_id=%s",
 		res.Name, principal.Redacted(), msg.MessageID)
-	return p.replyCommand(ctx, receiver, idType, reply)
+	return p.replyCommand(ctx, replySender, receiver, idType, reply)
 }
 
 // commandAllowed 判定命令权限（SPEC §5.3）。
@@ -734,13 +756,25 @@ func (p *Pipeline) pendingCount() int { return 0 }
 //
 // 与 deliverAsText 的区别：命令**不调用模型**、**不写会话历史**、
 // **不占串行域**——它只是一次出站。
+// replyCommand 用一个**指定的 sender** 投递命令回复。
+//
+// 为什么必须显式传 sender（而非用 p.sender）：多 agent 部署下每个 agent
+// 有自己的飞书凭据，回复必须由**接收该消息的那个 bot** 发出。用全局
+// p.sender 会让所有命令回复都显示同一个 bot 的身份——2026-10-02 实测：
+//
+//	@网络服务助手 /whoami → 回复发送者显示「道客服务助手」
+//	@道客服务助手 /whoami → 回复发送者显示「道客服务助手」
+//
+// 这是「凭据隔离」在命令路径上的遗漏：普通回复走 senderFor(agent) 隔离了，
+// 命令回复没有（当时用的是全局单值）。
 func (p *Pipeline) replyCommand(
 	ctx context.Context,
+	sender channel.Sender,
 	receiver string,
 	idType channel.ReceiveIDType,
 	text string,
 ) error {
-	if _, err := p.sender.SendMessage(ctx, receiver, text, channel.SendOptions{
+	if _, err := sender.SendMessage(ctx, receiver, text, channel.SendOptions{
 		ReceiveIDType: idType,
 	}); err != nil {
 		return fmt.Errorf("server: reply command: %w", err)

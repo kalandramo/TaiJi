@@ -445,3 +445,56 @@ Parse 失败 → 走正常消息路径 → 模型看到 "@_user_1 /whoami" → �
 「用户级验收」标为 `met`——那是过早的。纯函数 + 私聊 e2e 覆盖不到
 「群聊 @bot」这条路径。教训：声明 acceptance 达标前，要先确认
 **测试用的输入形态与真实场景一致**。
+
+### 8.9 命令回复用错 bot 身份（凭据隔离在命令路径的遗漏）
+
+**现象**（截图）：群里 @两个 bot 各发 `/whoami`，两条回复**都显示同一个
+bot 的名字**：
+
+```
+@网络服务助手 /whoami → 回复发送者显示「道客服务助手」
+@道客服务助手 /whoami → 回复发送者显示「道客服务助手」
+```
+
+**根因**：正常消息路径用 `senderFor(agent)` 选该 agent 的飞书凭据
+（**凭据隔离的落点**），但命令路径的 `replyCommand` 用的是 `p.sender`
+（**全局单值**）——多 agent 部署下命令回复总是由同一个 bot 发出。
+
+**修复**：`replyCommand` 接受显式 `sender` 参数；`handleCommand` 用
+`resolveAgent(msg)` + `senderFor(agent)` 选出正确的 sender，与正常
+消息路径**同源**（同一套解析，避免两条路径语义漂移）。
+
+**失败处理**：`resolveAgent` 报错时回退全局 sender 并记日志，不阻断命令
+——命令多为自省/控制类，静默不响应比用错身份发出更糟；且正常消息路径
+已在更早处对未知 AppID fail-closed，此处不构成绕过点。
+
+**验证**：
+- `TestCommand_ReplyUsesAgentSpecificSender`（消息属 beta，断言回复用
+  BETA 而非 DEFAULT/ALPHA）
+- **反证**：改回全局 sender → `实际: DEFAULT`（与截图现象一致）
+
+### 8.10 本节的实测结论（用户真实运行）
+
+两个 bot 在同一群里各发 `/whoami`，回复：
+
+```
+主体 ID：default:feishu:on_2fb858167bfd7627928743231966355   ← 两个 bot 相同
+身份键来源：union_id（跨应用稳定）
+平台 open_id：ou_0438cd9e...（bill 应用）
+平台 open_id：ou_44dc01ee...（root 应用）                     ← 两个不同
+```
+
+**这组数据同时验证了两件事**：
+
+1. **union_id 跨应用稳定**（§8.2 的假设在此得到端到端确认）——
+   主体 ID 相同，故 RBAC 只需配置一次
+2. **open_id 确实是应用维度的**——两个不同值，正是 §8.2 故障的根源
+
+日志侧的对应证据：
+
+```
+分流 ... app_id=cli_aa126d218d789d05 agent=bill
+  → principal=default:feishu:4665abbf
+分流 ... app_id=cli_aa0110cf25f41be2 agent=root
+  → principal=default:feishu:4665abbf   ← 同一个
+```
